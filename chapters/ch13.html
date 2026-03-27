@@ -1,0 +1,820 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Chapter 13: Retrieval and Ranking with Transformers — Transformer Research Book</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <link rel="stylesheet" href="../assets/math.css">
+  <link rel="stylesheet" href="../assets/prism.css">
+  <!-- KaTeX for math rendering -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left: '$$', right: '$$', display: true},
+        {left: '$', right: '$', display: false}
+      ]
+    })">
+  </script>
+  <!-- Prism for code blocks -->
+  <script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/prism.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-python.min.js"></script>
+</head>
+<body>
+  <nav class="chapter-nav">
+    <a href="../index.html" class="nav-home">← Table of Contents</a>
+    <span class="nav-chapter">Chapter 13</span>
+    <div style="display:flex; align-items:center; gap:1rem;">
+      <button class="theme-toggle" onclick="toggleTheme()" aria-label="Toggle dark mode">
+        <span class="icon-moon">&#9789;</span><span class="icon-sun">&#9788;</span>
+      </button>
+      <a href="ch14.html" class="nav-next">Next Chapter →</a>
+    </div>
+  </nav>
+  <script>
+    function toggleTheme() {
+      document.documentElement.classList.toggle('dark');
+      localStorage.setItem('theme', document.documentElement.classList.contains('dark') ? 'dark' : 'light');
+    }
+    if (localStorage.getItem('theme') === 'dark') document.documentElement.classList.add('dark');
+  </script>
+
+  <article class="chapter">
+
+    <header class="chapter-header">
+      <div class="chapter-number">Chapter 13</div>
+      <h1 class="chapter-title">Retrieval and Ranking with Transformers</h1>
+      <p class="chapter-lead">Search "jaguar speed" on a lexical search engine and you will get results about both the animal and the car — the system matches words, not meaning. Replace the keyword matcher with a BERT encoder that maps the query and every document into the same vector space, and now "fast feline" retrieves the same pages as "jaguar speed" because both land near the same point in embedding space. This chapter walks through every layer of the modern retrieval stack: from classical BM25 to dense passage retrieval, from single-vector cosine similarity to ColBERT's token-level late interaction, from pointwise reranking to agentic RAG pipelines that decide what to retrieve, when, and how many times. By the end, you will understand why the fastest production systems in 2026 run hybrid sparse-dense retrieval with learned reranking — and how to build one.</p>
+    </header>
+
+    <!-- ================================================================== -->
+    <!-- SECTION 1: THE INFORMATION RETRIEVAL LANDSCAPE                     -->
+    <!-- ================================================================== -->
+    <section class="chapter-section" id="information-retrieval-landscape">
+      <h2>The Information Retrieval Landscape</h2>
+
+      <p>Before transformers touched search, two paradigms dominated: lexical matching and vector similarity. Understanding both is essential because production systems in 2026 still use both — hybrid retrieval outperforms either alone.</p>
+
+      <h3>Classical Retrieval: TF-IDF and BM25</h3>
+
+      <p><strong>TF-IDF</strong> (Term Frequency–Inverse Document Frequency) represents each document as a sparse vector in vocabulary space. Each dimension corresponds to a word, and the value is the product of how often the word appears in the document (TF) and how rare it is across the corpus (IDF). Cosine similarity between query and document TF-IDF vectors gives a relevance score.</p>
+
+      <p><strong>BM25</strong> improves on TF-IDF with two corrections: it saturates the term frequency contribution (a word appearing 100 times is not 100× more relevant than one appearance), and it normalizes by document length (longer documents are not penalized just for containing more words). BM25 remains the default first-stage retriever in production — it is fast, requires no training, and handles exact-match queries (product IDs, code identifiers, rare proper nouns) that dense models miss.</p>
+
+      <h3>The Semantic Gap</h3>
+
+      <p>Lexical matching fails when the query and the relevant document use different words for the same concept. "Car" does not match "automobile." "How to fix a memory leak" does not match a document titled "Debugging heap exhaustion in Java." This <strong>semantic gap</strong> — the distance between surface-level word overlap and underlying meaning — is what neural retrieval models exist to close.</p>
+
+      <h3>Dense Retrieval: The Core Idea</h3>
+
+      <p>Map queries and documents into a shared vector space where semantic similarity corresponds to geometric proximity. Train the encoder so that a query about "fast felines" lands near a document about "jaguar speed records" even though they share no words. At retrieval time, compute the query vector, run approximate nearest neighbor search over the document vectors, and return the closest matches.</p>
+
+      <figure class="diagram-figure">
+        <svg width="100%" viewBox="0 0 800 320" xmlns="http://www.w3.org/2000/svg">
+          <defs>
+            <marker id="ch13-arr" viewBox="0 0 10 10" refX="9" refY="5"
+              markerWidth="5" markerHeight="5" orient="auto-start-reverse">
+              <path d="M1 1L9 5L1 9" fill="none" stroke="context-stroke"
+                stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+            </marker>
+          </defs>
+
+          <text x="400" y="22" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="14" font-weight="600" fill="#1A1A18">Lexical vs. Dense Retrieval</text>
+
+          <!-- Panel headers -->
+          <rect x="30" y="42" width="360" height="28" rx="5" fill="#FAECE7" stroke="#F0997B" stroke-width="1"/>
+          <text x="210" y="61" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="600" fill="#993C1D">Lexical (BM25): Word Matching</text>
+
+          <rect x="410" y="42" width="360" height="28" rx="5" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1"/>
+          <text x="590" y="61" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="600" fill="#0F6E56">Dense: Meaning Matching</text>
+
+          <line x1="400" y1="38" x2="400" y2="310" stroke="#E5E3DC" stroke-width="1" stroke-dasharray="5 4"/>
+
+          <!-- Lexical side -->
+          <rect x="50" y="86" width="160" height="32" rx="6" fill="#534AB7" stroke="#534AB7"/>
+          <text x="130" y="107" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#FFFFFF">Query: "fast feline"</text>
+
+          <rect x="50" y="140" width="320" height="32" rx="6" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1"/>
+          <text x="210" y="161" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#0F6E56">Doc A: "The jaguar can reach 80 mph"</text>
+
+          <rect x="50" y="182" width="320" height="32" rx="6" fill="#F1EFE8" stroke="#C8C6BE" stroke-width="1"/>
+          <text x="210" y="203" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#9C9A94">Doc B: "Fast feline facts for kids"</text>
+
+          <!-- X mark on Doc A, check on Doc B -->
+          <text x="60" y="161" font-family="system-ui, -apple-system, sans-serif" font-size="14" font-weight="600" fill="#993C1D">✗</text>
+          <text x="60" y="203" font-family="system-ui, -apple-system, sans-serif" font-size="14" font-weight="600" fill="#0F6E56">✓</text>
+
+          <text x="210" y="240" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#993C1D">Misses Doc A — no word overlap</text>
+          <text x="210" y="256" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#993C1D">Ranks Doc B higher (exact match)</text>
+
+          <!-- Dense side -->
+          <rect x="430" y="86" width="160" height="32" rx="6" fill="#534AB7" stroke="#534AB7"/>
+          <text x="510" y="107" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#FFFFFF">Query: "fast feline"</text>
+
+          <!-- Embedding space visualization -->
+          <circle cx="590" cy="120" r="60" fill="none" stroke="#E5E3DC" stroke-width="1" stroke-dasharray="4 3"/>
+
+          <!-- Query dot -->
+          <circle cx="580" cy="105" r="5" fill="#534AB7"/>
+          <text x="575" y="98" text-anchor="end" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="500" fill="#534AB7">q</text>
+
+          <!-- Doc A dot (close) -->
+          <circle cx="598" cy="112" r="5" fill="#0F6E56"/>
+          <text x="613" y="110" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="500" fill="#0F6E56">A</text>
+
+          <!-- Doc B dot (also close but less) -->
+          <circle cx="570" cy="130" r="5" fill="#854F0B"/>
+          <text x="558" y="138" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="500" fill="#854F0B">B</text>
+
+          <!-- Doc C dot (far) -->
+          <circle cx="625" cy="150" r="4" fill="#C8C6BE"/>
+          <text x="636" y="153" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#9C9A94">C</text>
+
+          <rect x="430" y="192" width="320" height="32" rx="6" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1.5"/>
+          <text x="590" y="213" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#0F6E56">Doc A: closest in embedding space ✓</text>
+
+          <text x="590" y="250" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#0F6E56">Finds Doc A — same meaning, different words</text>
+          <text x="590" y="266" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#0F6E56">"jaguar" and "feline" are nearby in vector space</text>
+        </svg>
+        <figcaption>Figure 13.1 — Lexical retrieval (left) matches surface-level words — it misses Doc A because "jaguar" and "feline" share no characters. Dense retrieval (right) embeds queries and documents into a shared vector space where semantic similarity corresponds to geometric proximity. "Fast feline" and "jaguar speed" land near each other because their BERT encoders learned they mean similar things.</figcaption>
+      </figure>
+
+      <h3>Bi-Encoder vs. Cross-Encoder</h3>
+
+      <p>Two fundamental architectures compete for retrieval and ranking. The choice between them defines the efficiency-quality curve of every modern search system.</p>
+
+      <p>A <strong>bi-encoder</strong> encodes the query and the document *independently* with separate forward passes. The similarity score is a simple function of the two vectors — typically cosine similarity: $\text{sim}(q, d) = \frac{q^\top d}{\|q\|\|d\|}$ (dot product of normalized vectors, yielding a scalar). Because document vectors are pre-computed and cached, retrieval requires only one forward pass (for the query) plus a vector search. This is fast — milliseconds over millions of documents.</p>
+
+      <p>A <strong>cross-encoder</strong> concatenates the query and the document into a single input: $[\text{CLS}] \; q_1 \ldots q_m \; [\text{SEP}] \; d_1 \ldots d_n \; [\text{SEP}]$. The transformer attends jointly over both, capturing fine-grained token-level interactions. This is dramatically more accurate — the model sees how every query word relates to every document word — but requires a forward pass per (query, document) pair. Running a cross-encoder over a million documents is impractical.</p>
+
+      <figure class="diagram-figure">
+        <svg width="100%" viewBox="0 0 800 280" xmlns="http://www.w3.org/2000/svg">
+          <text x="400" y="22" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="14" font-weight="600" fill="#1A1A18">Bi-Encoder vs. Cross-Encoder</text>
+
+          <!-- Bi-encoder side -->
+          <rect x="30" y="42" width="350" height="28" rx="5" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1"/>
+          <text x="205" y="61" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="600" fill="#0F6E56">Bi-Encoder (Retrieval)</text>
+
+          <!-- Query encoder -->
+          <rect x="50" y="86" width="130" height="36" rx="6" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1.5"/>
+          <text x="115" y="109" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#534AB7">Query Encoder</text>
+          <line x1="115" y1="122" x2="115" y2="142" stroke="#534AB7" stroke-width="1.5" marker-end="url(#ch13-arr)"/>
+          <rect x="80" y="144" width="70" height="24" rx="4" fill="#534AB7"/>
+          <text x="115" y="160" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="500" fill="#FFFFFF">q ∈ ℝ^d</text>
+
+          <!-- Doc encoder -->
+          <rect x="230" y="86" width="130" height="36" rx="6" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1.5"/>
+          <text x="295" y="109" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#0F6E56">Doc Encoder</text>
+          <line x1="295" y1="122" x2="295" y2="142" stroke="#0F6E56" stroke-width="1.5" marker-end="url(#ch13-arr)"/>
+          <rect x="260" y="144" width="70" height="24" rx="4" fill="#0F6E56"/>
+          <text x="295" y="160" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="500" fill="#FFFFFF">d ∈ ℝ^d</text>
+
+          <!-- Cosine similarity -->
+          <line x1="150" y1="156" x2="250" y2="156" stroke="#9C9A94" stroke-width="1" stroke-dasharray="3 2"/>
+          <text x="205" y="192" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="500" fill="#5C5B56">cos(q, d)</text>
+
+          <text x="205" y="220" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#0F6E56">✓ Fast: 1 query pass + vector search</text>
+          <text x="205" y="236" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#0F6E56">✓ Pre-compute doc embeddings</text>
+          <text x="205" y="252" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#993C1D">✗ No token-level interaction</text>
+
+          <!-- Divider -->
+          <line x1="400" y1="38" x2="400" y2="270" stroke="#E5E3DC" stroke-width="1" stroke-dasharray="5 4"/>
+
+          <!-- Cross-encoder side -->
+          <rect x="420" y="42" width="350" height="28" rx="5" fill="#FAECE7" stroke="#F0997B" stroke-width="1"/>
+          <text x="595" y="61" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="600" fill="#993C1D">Cross-Encoder (Reranking)</text>
+
+          <!-- Joint encoder -->
+          <rect x="440" y="86" width="310" height="36" rx="6" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1.5"/>
+          <text x="595" y="102" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="500" fill="#534AB7">[CLS] query tokens [SEP] doc tokens [SEP]</text>
+          <text x="595" y="116" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#9C9A94">Full cross-attention between q and d</text>
+
+          <line x1="595" y1="122" x2="595" y2="142" stroke="#534AB7" stroke-width="1.5" marker-end="url(#ch13-arr)"/>
+
+          <rect x="545" y="144" width="100" height="24" rx="4" fill="#534AB7"/>
+          <text x="595" y="160" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="500" fill="#FFFFFF">score ∈ ℝ</text>
+
+          <text x="595" y="198" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#0F6E56">✓ Precise: full token interaction</text>
+          <text x="595" y="214" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#0F6E56">✓ Captures nuanced relevance</text>
+          <text x="595" y="230" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#993C1D">✗ Slow: forward pass per (q, d) pair</text>
+          <text x="595" y="246" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#993C1D">✗ Cannot pre-compute doc representations</text>
+        </svg>
+        <figcaption>Figure 13.2 — The bi-encoder (left) encodes query and document independently, scoring by vector similarity. It is fast because document embeddings are pre-computed — retrieval requires only one encoder pass for the query. The cross-encoder (right) concatenates query and document into a single input with full cross-attention, yielding much more accurate scores but requiring one forward pass per (query, document) pair. Production systems use bi-encoders for retrieval and cross-encoders for reranking.</figcaption>
+      </figure>
+
+      <p>The production solution: use both. A bi-encoder retrieves the top 100-1000 candidates from millions of documents in milliseconds. A cross-encoder reranks those candidates, spending the compute budget where it matters most. This <strong>cascade architecture</strong> — retrieve then rerank — is the backbone of every modern search system.</p>
+
+    </section>
+
+    <!-- ================================================================== -->
+    <!-- SECTION 2: DENSE PASSAGE RETRIEVAL                                 -->
+    <!-- ================================================================== -->
+    <section class="chapter-section" id="dense-passage-retrieval">
+      <h2>Dense Passage Retrieval (DPR)</h2>
+
+      <p>DPR (Karpukhin et al., 2020) established the template for neural retrieval: two BERT encoders, contrastive training, and FAISS for nearest-neighbor search at scale.</p>
+
+      <h3>Architecture</h3>
+
+      <p>DPR uses two independent BERT encoders — one for questions, one for passages. Each produces a single vector from the [CLS] token's hidden state. The similarity between a question $q$ and passage $p$ is computed as their dot product: $\text{sim}(q, p) = E_Q(q)^\top E_P(p)$ (dot product yielding a scalar, where $E_Q(q) \in \mathbb{R}^d$ and $E_P(p) \in \mathbb{R}^d$).</p>
+
+      <h3>Contrastive Training with Hard Negatives</h3>
+
+      <p>The training objective pushes the positive passage closer to its question and the negative passages further away. For a question $q_i$ with positive passage $p_i^+$ and $N$ negative passages $\{p_{i,j}^-\}$, the loss is:</p>
+
+      $$\mathcal{L} = -\log \frac{e^{\text{sim}(q_i, p_i^+)}}{e^{\text{sim}(q_i, p_i^+)} + \sum_{j=1}^{N} e^{\text{sim}(q_i, p_{i,j}^-)}}$$
+
+      <p>This is the <strong>InfoNCE</strong> contrastive loss — structurally identical to the softmax cross-entropy, treating the positive as the correct class. The key to DPR's success is the choice of negatives: in-batch negatives (other questions' positives in the same mini-batch, cheap), BM25 negatives (passages that match lexically but are semantically wrong, hard), and gold negatives from the dataset. Hard negatives force the model to learn fine-grained distinctions rather than trivial ones.</p>
+
+      <p>Here is a DPR-style bi-encoder with contrastive training in PyTorch:</p>
+
+<pre><code class="language-python">
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class BiEncoder(nn.Module):
+    """DPR-style bi-encoder: independent query and passage encoders."""
+    def __init__(self, d_model=768, d_embed=128):
+        super().__init__()
+        # In practice these would be BERT encoders; simplified here
+        self.query_proj = nn.Linear(d_model, d_embed)
+        self.passage_proj = nn.Linear(d_model, d_embed)
+
+    def encode_query(self, q_hidden):
+        return F.normalize(self.query_proj(q_hidden), dim=-1)   # (B, d_embed)
+
+    def encode_passage(self, p_hidden):
+        return F.normalize(self.passage_proj(p_hidden), dim=-1) # (B, d_embed)
+
+def contrastive_loss(q_embeds, p_embeds, temperature=0.05):
+    """InfoNCE contrastive loss with in-batch negatives.
+
+    q_embeds: (B, d) normalized query embeddings
+    p_embeds: (B, d) normalized passage embeddings
+    Each q_embeds[i] is a positive match for p_embeds[i].
+    All other passages in the batch serve as negatives.
+    """
+    # Similarity matrix: q_i^T p_j for all (i, j) pairs
+    scores = q_embeds @ p_embeds.T / temperature               # (B, B)
+    # Labels: q_i should match p_i (diagonal)
+    labels = torch.arange(scores.size(0), device=scores.device) # (B,)
+    loss = F.cross_entropy(scores, labels)
+    return loss
+</code></pre>
+
+      <h3>FAISS: Billion-Scale Nearest Neighbor Search</h3>
+
+      <p>Once passage vectors are computed, retrieval reduces to a nearest-neighbor search: find the $k$ passages whose vectors are closest to the query vector. Exact search over billions of vectors is impractical — a brute-force scan of 1 billion 768-dimensional vectors takes seconds per query. <strong>FAISS</strong> (Facebook AI Similarity Search) solves this with approximate nearest neighbor algorithms.</p>
+
+      <p>The two most common FAISS index types are <strong>IVF</strong> (Inverted File Index), which partitions the vector space into clusters and only searches the nearest clusters to the query, and <strong>PQ</strong> (Product Quantization), which compresses each vector into a short code for memory efficiency. Combined as IVF-PQ, FAISS searches billions of vectors in under 10 milliseconds with recall above 90%.</p>
+
+      <h3>DPR vs. BM25: When Each Wins</h3>
+
+      <figure class="diagram-figure">
+        <svg width="100%" viewBox="0 0 800 200" xmlns="http://www.w3.org/2000/svg">
+          <text x="400" y="22" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="14" font-weight="600" fill="#1A1A18">DPR vs. BM25: Complementary Strengths</text>
+
+          <!-- BM25 wins column -->
+          <rect x="40" y="48" width="340" height="28" rx="5" fill="#FAEEDA" stroke="#EF9F27" stroke-width="1"/>
+          <text x="210" y="67" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="600" fill="#854F0B">BM25 Wins</text>
+
+          <text x="60" y="100" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#5C5B56">• Exact match: product IDs, code symbols</text>
+          <text x="60" y="120" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#5C5B56">• Rare proper nouns, technical jargon</text>
+          <text x="60" y="140" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#5C5B56">• Zero-shot (no training data needed)</text>
+          <text x="60" y="160" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#5C5B56">• Sub-millisecond over inverted indexes</text>
+
+          <!-- DPR wins column -->
+          <rect x="420" y="48" width="340" height="28" rx="5" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1"/>
+          <text x="590" y="67" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="600" fill="#534AB7">DPR Wins</text>
+
+          <text x="440" y="100" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#5C5B56">• Paraphrase: "car" matches "automobile"</text>
+          <text x="440" y="120" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#5C5B56">• Intent: "fix memory leak" → heap debug</text>
+          <text x="440" y="140" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#5C5B56">• Cross-lingual: query in English, docs in French</text>
+          <text x="440" y="160" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#5C5B56">• Implicit concepts (no matching keyword)</text>
+
+          <!-- Bottom note -->
+          <text x="400" y="190" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#9C9A94">→ Hybrid retrieval (BM25 + dense + RRF fusion) outperforms both in 7/8 benchmarks</text>
+        </svg>
+        <figcaption>Figure 13.3 — BM25 excels at exact-match queries and rare terms. DPR excels at semantic queries and paraphrases. Hybrid retrieval combines both, using Reciprocal Rank Fusion (RRF) to merge result lists — consistently outperforming either approach alone.</figcaption>
+      </figure>
+
+    </section>
+
+    <!-- ================================================================== -->
+    <!-- SECTION 3: COLBERT — LATE INTERACTION                              -->
+    <!-- ================================================================== -->
+    <section class="chapter-section" id="colbert-late-interaction">
+      <h2>ColBERT: Late Interaction</h2>
+
+      <p>Bi-encoders compress an entire document into one vector. This is efficient but lossy — a 500-word passage reduced to 128 numbers cannot preserve every nuance. Cross-encoders preserve every nuance but are too slow for retrieval. ColBERT (Khattab &amp; Zaharia, SIGIR 2020) occupies the sweet spot: it retains per-token representations while still allowing pre-computation of document embeddings.</p>
+
+      <h3>MaxSim: Token-Level Matching</h3>
+
+      <p>ColBERT represents each query as a set of token embeddings $\{q_1, \ldots, q_m\}$ and each document as $\{d_1, \ldots, d_n\}$ (each $q_i, d_j \in \mathbb{R}^{d}$). The relevance score is the sum of maximum similarities:</p>
+
+      $$\text{score}(q, d) = \sum_{i=1}^{m} \max_{j=1}^{n} \; q_i^\top d_j$$
+
+      <p>For each query token $q_i$, find the document token $d_j$ it matches best (dot product, yielding a scalar), and sum these maximum similarities. This <strong>MaxSim</strong> operation captures token-level semantic matching — "speed" in the query aligns with "mph" in the document, while "feline" aligns with "jaguar" — without requiring joint attention between query and document.</p>
+
+      <figure class="diagram-figure">
+        <svg width="100%" viewBox="0 0 800 300" xmlns="http://www.w3.org/2000/svg">
+          <text x="400" y="22" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="14" font-weight="600" fill="#1A1A18">ColBERT MaxSim: Token-Level Late Interaction</text>
+
+          <!-- Query tokens -->
+          <text x="70" y="60" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="600" fill="#534AB7">QUERY</text>
+          <rect x="50" y="70" width="70" height="32" rx="4" fill="#534AB7"/>
+          <text x="85" y="91" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="500" fill="#FFFFFF">fast</text>
+
+          <rect x="130" y="70" width="80" height="32" rx="4" fill="#534AB7"/>
+          <text x="170" y="91" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="500" fill="#FFFFFF">feline</text>
+
+          <rect x="220" y="70" width="80" height="32" rx="4" fill="#534AB7"/>
+          <text x="260" y="91" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="500" fill="#FFFFFF">speed</text>
+
+          <!-- Document tokens -->
+          <text x="70" y="180" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="600" fill="#0F6E56">DOCUMENT</text>
+          <rect x="50" y="190" width="60" height="32" rx="4" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1"/>
+          <text x="80" y="211" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#0F6E56">the</text>
+
+          <rect x="120" y="190" width="80" height="32" rx="4" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1.5"/>
+          <text x="160" y="211" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="500" fill="#0F6E56">jaguar</text>
+
+          <rect x="210" y="190" width="60" height="32" rx="4" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1"/>
+          <text x="240" y="211" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#0F6E56">can</text>
+
+          <rect x="280" y="190" width="70" height="32" rx="4" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1"/>
+          <text x="315" y="211" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#0F6E56">reach</text>
+
+          <rect x="360" y="190" width="50" height="32" rx="4" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1.5"/>
+          <text x="385" y="211" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="500" fill="#0F6E56">80</text>
+
+          <rect x="420" y="190" width="60" height="32" rx="4" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1.5"/>
+          <text x="450" y="211" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="500" fill="#0F6E56">mph</text>
+
+          <!-- MaxSim lines: each query token to its best-matching doc token -->
+          <line x1="85" y1="102" x2="315" y2="190" stroke="#534AB7" stroke-width="2.5" opacity="0.8"/>
+          <text x="220" y="142" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="500" fill="#534AB7">0.82</text>
+
+          <line x1="170" y1="102" x2="160" y2="190" stroke="#534AB7" stroke-width="3" opacity="0.9"/>
+          <text x="140" y="142" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="500" fill="#534AB7">0.91</text>
+
+          <line x1="260" y1="102" x2="450" y2="190" stroke="#534AB7" stroke-width="2" opacity="0.7"/>
+          <text x="370" y="142" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="500" fill="#534AB7">0.78</text>
+
+          <!-- Score -->
+          <rect x="540" y="130" width="220" height="40" rx="6" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1.5"/>
+          <text x="650" y="148" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#534AB7">Score = 0.91 + 0.82 + 0.78</text>
+          <text x="650" y="164" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="600" fill="#534AB7">= 2.51</text>
+
+          <!-- Annotation -->
+          <text x="650" y="200" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#9C9A94">"feline" → "jaguar" (best match)</text>
+          <text x="650" y="216" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#9C9A94">"fast" → "reach" (best match)</text>
+          <text x="650" y="232" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#9C9A94">"speed" → "mph" (best match)</text>
+        </svg>
+        <figcaption>Figure 13.4 — ColBERT's MaxSim scoring. Each query token (purple) finds its highest-scoring document token (teal) via dot product. Line thickness represents match strength. "feline" matches best with "jaguar" (0.91), "fast" with "reach" (0.82), "speed" with "mph" (0.78). The final relevance score is the sum of these maximum similarities. Unlike a bi-encoder's single-vector comparison, MaxSim captures fine-grained token-level semantic alignment.</figcaption>
+      </figure>
+
+      <h3>ColBERTv2 and PLAID</h3>
+
+      <p><strong>ColBERTv2</strong> (Santhanam et al., NAACL 2022) addresses the original ColBERT's storage cost — storing per-token embeddings for every document requires 6-10× more space than single-vector approaches. ColBERTv2 applies <strong>residual compression</strong>: each token embedding is quantized relative to its nearest centroid, storing only the small residual. Combined with denoised supervision (distillation from a cross-encoder teacher with hard negative mining), ColBERTv2 reduces storage by 6-10× while improving retrieval quality.</p>
+
+      <p><strong>PLAID</strong> (Performance-optimized Late Interaction Driver) further accelerates ColBERT search. The key trick: treat each passage as a lightweight "bag of centroids" and use centroid interaction to quickly eliminate low-scoring passages before computing the full MaxSim. PLAID achieves 7× speedup on GPU and 45× on CPU over vanilla ColBERTv2, with retrieval latency of tens of milliseconds over 140 million passages.</p>
+
+      <h3>ColPali: Vision-Native Document Retrieval</h3>
+
+      <p><strong>ColPali</strong> (ICLR 2025) extends late interaction to visual documents. Instead of extracting text from PDFs through OCR and layout analysis, ColPali directly embeds a *screenshot* of the document page using a Vision Language Model (PaliGemma). The "Col" in ColPali — as in ColBERT — means the model produces multiple vectors per page (one per visual patch), and scoring uses MaxSim across query tokens and visual patch embeddings.</p>
+
+      <p>ColPali dramatically outperforms text-extraction pipelines on visually rich documents: infographics, tables, charts, and mixed-language layouts. It eliminates the entire preprocessing stack — no OCR, no layout parsing, no text chunking — replacing it with a single end-to-end model.</p>
+
+      <p>Here is a ColBERT-style MaxSim scoring implementation in PyTorch:</p>
+
+<pre><code class="language-python">
+import torch
+import torch.nn.functional as F
+
+def colbert_maxsim(q_embeddings, d_embeddings):
+    """ColBERT MaxSim scoring between query and document token embeddings.
+
+    Args:
+        q_embeddings: (m, d) — m query token embeddings
+        d_embeddings: (n, d) — n document token embeddings
+    Returns:
+        score: scalar — sum of max similarities per query token
+    """
+    # Token-level similarity matrix: q_i^T d_j for all pairs
+    sim_matrix = q_embeddings @ d_embeddings.T                  # (m, n)
+    # MaxSim: for each query token, find best-matching doc token
+    max_sims = sim_matrix.max(dim=1).values                     # (m,)
+    # Score = sum of max similarities
+    return max_sims.sum()                                        # scalar
+
+def colbert_batch_score(q_batch, d_batch):
+    """Score a batch of query-document pairs with ColBERT MaxSim.
+
+    Args:
+        q_batch: (B, m, d) — B queries, m tokens each
+        d_batch: (B, n, d) — B documents, n tokens each
+    """
+    # Batched similarity: each query against its corresponding document
+    sim = torch.bmm(q_batch, d_batch.transpose(1, 2))          # (B, m, n)
+    max_sims = sim.max(dim=2).values                            # (B, m)
+    return max_sims.sum(dim=1)                                   # (B,)
+</code></pre>
+
+    </section>
+
+    <!-- ================================================================== -->
+    <!-- SECTION 4: SPARSE LEARNED RETRIEVAL                                -->
+    <!-- ================================================================== -->
+    <section class="chapter-section" id="sparse-learned-retrieval">
+      <h2>Sparse Learned Retrieval</h2>
+
+      <p>BM25 uses sparse vectors (vocabulary-sized, mostly zeros). Dense retrieval uses dense vectors (128-768 dimensions, no zeros). Sparse learned retrieval occupies the middle ground: it produces sparse, vocabulary-sized vectors — just like BM25 — but learns the weights using a neural network instead of counting term frequencies.</p>
+
+      <h3>SPLADE: Sparse Lexical Expansion</h3>
+
+      <p><strong>SPLADE</strong> (SParse Lexical AnD Expansion model) uses BERT's masked language model head to produce a sparse document representation. For each token in the document, BERT predicts a distribution over the entire vocabulary. SPLADE takes the maximum prediction score across all positions for each vocabulary term, then applies a log-saturation function to produce the final sparse vector.</p>
+
+      <p>The critical capability: <strong>lexical expansion</strong>. A document about "Python memory management" will receive non-zero weights for related terms like "garbage collection," "heap," and "reference counting" — even if those exact words do not appear in the text. This bridges the semantic gap while maintaining compatibility with inverted indexes, meaning SPLADE can run on the same infrastructure as BM25.</p>
+
+      <h3>uniCOIL: Learned Term Weights</h3>
+
+      <p><strong>uniCOIL</strong> (Unified COntextualized Inverted List) takes a simpler approach: it uses BERT to predict a single scalar weight for each token in the document, producing a sparse vector with non-zero entries only for tokens that actually appear. This makes it directly compatible with standard BM25 inverted indexes — just replace the BM25 term weights with learned ones. No new infrastructure needed.</p>
+
+      <h3>Hybrid Retrieval and Reciprocal Rank Fusion</h3>
+
+      <figure class="diagram-figure">
+        <svg width="100%" viewBox="0 0 800 280" xmlns="http://www.w3.org/2000/svg">
+          <text x="400" y="22" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="14" font-weight="600" fill="#1A1A18">Hybrid Retrieval with Reciprocal Rank Fusion (RRF)</text>
+
+          <!-- Query -->
+          <rect x="300" y="44" width="200" height="32" rx="6" fill="#534AB7" stroke="#534AB7"/>
+          <text x="400" y="65" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#FFFFFF">User Query</text>
+
+          <!-- Fork -->
+          <line x1="400" y1="76" x2="400" y2="90" stroke="#9C9A94" stroke-width="1.5"/>
+          <line x1="160" y1="90" x2="640" y2="90" stroke="#9C9A94" stroke-width="1.5"/>
+          <line x1="160" y1="90" x2="160" y2="106" stroke="#9C9A94" stroke-width="1.5" marker-end="url(#ch13-arr)"/>
+          <line x1="400" y1="90" x2="400" y2="106" stroke="#9C9A94" stroke-width="1.5" marker-end="url(#ch13-arr)"/>
+          <line x1="640" y1="90" x2="640" y2="106" stroke="#9C9A94" stroke-width="1.5" marker-end="url(#ch13-arr)"/>
+
+          <!-- BM25 -->
+          <rect x="80" y="108" width="160" height="40" rx="6" fill="#FAEEDA" stroke="#EF9F27" stroke-width="1.5"/>
+          <text x="160" y="125" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#854F0B">BM25 / SPLADE</text>
+          <text x="160" y="141" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#854F0B">Sparse (lexical)</text>
+
+          <!-- Dense -->
+          <rect x="320" y="108" width="160" height="40" rx="6" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1.5"/>
+          <text x="400" y="125" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#534AB7">Dense Bi-Encoder</text>
+          <text x="400" y="141" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#534AB7">Semantic similarity</text>
+
+          <!-- ColBERT -->
+          <rect x="560" y="108" width="160" height="40" rx="6" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1.5"/>
+          <text x="640" y="125" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#0F6E56">ColBERT</text>
+          <text x="640" y="141" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#0F6E56">Late interaction</text>
+
+          <!-- Ranked lists -->
+          <line x1="160" y1="148" x2="160" y2="164" stroke="#854F0B" stroke-width="1.5" marker-end="url(#ch13-arr)"/>
+          <line x1="400" y1="148" x2="400" y2="164" stroke="#534AB7" stroke-width="1.5" marker-end="url(#ch13-arr)"/>
+          <line x1="640" y1="148" x2="640" y2="164" stroke="#0F6E56" stroke-width="1.5" marker-end="url(#ch13-arr)"/>
+
+          <text x="160" y="178" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#5C5B56">Rank list 1</text>
+          <text x="400" y="178" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#5C5B56">Rank list 2</text>
+          <text x="640" y="178" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#5C5B56">Rank list 3</text>
+
+          <!-- Merge -->
+          <line x1="160" y1="184" x2="160" y2="200" stroke="#9C9A94" stroke-width="1"/>
+          <line x1="400" y1="184" x2="400" y2="200" stroke="#9C9A94" stroke-width="1"/>
+          <line x1="640" y1="184" x2="640" y2="200" stroke="#9C9A94" stroke-width="1"/>
+          <line x1="160" y1="200" x2="640" y2="200" stroke="#9C9A94" stroke-width="1"/>
+          <line x1="400" y1="200" x2="400" y2="216" stroke="#9C9A94" stroke-width="1.5" marker-end="url(#ch13-arr)"/>
+
+          <!-- RRF box -->
+          <rect x="260" y="218" width="280" height="40" rx="6" fill="#FAECE7" stroke="#F0997B" stroke-width="1.5"/>
+          <text x="400" y="237" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#993C1D">RRF: score(d) = Σ 1/(k + rank_i(d))</text>
+          <text x="400" y="252" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#993C1D">k=60 typically. Score-agnostic, uses rank positions only.</text>
+        </svg>
+        <figcaption>Figure 13.5 — Hybrid retrieval runs multiple retrievers in parallel (sparse, dense, late interaction), each producing a ranked list. Reciprocal Rank Fusion (RRF) merges the lists using only rank positions — no score normalization needed. A document ranked #1 by two retrievers and #50 by a third will score higher than a document ranked #10 by all three. RRF is simple, effective, and requires zero labeled data to tune.</figcaption>
+      </figure>
+
+      <p><strong>Reciprocal Rank Fusion (RRF)</strong> is the standard fusion algorithm. For a document $d$ appearing at rank $r_i$ in result list $i$:</p>
+
+      $$\text{RRF}(d) = \sum_{i} \frac{1}{k + r_i(d)}$$
+
+      <p>where $k = 60$ is a constant that prevents top-ranked documents from dominating. RRF is score-agnostic — it uses only rank positions, not raw scores — so it naturally handles the incomparable scales of BM25 scores, cosine similarities, and MaxSim sums without normalization.</p>
+
+    </section>
+
+    <!-- ================================================================== -->
+    <!-- SECTION 5: CROSS-ENCODERS FOR RERANKING                            -->
+    <!-- ================================================================== -->
+    <section class="chapter-section" id="cross-encoders-reranking">
+      <h2>Cross-Encoders for Reranking</h2>
+
+      <p>After retrieval returns the top 100-1000 candidates, a cross-encoder reranks them. The accuracy improvement is dramatic: a MiniLM cross-encoder reranking BM25 results often outperforms a dense retriever alone, despite the BM25 first stage being purely lexical.</p>
+
+      <h3>Architecture and Training Objectives</h3>
+
+      <p>The cross-encoder takes the concatenated query-document pair $[\text{CLS}] \; q \; [\text{SEP}] \; d \; [\text{SEP}]$ and produces a relevance score from the [CLS] token through a linear head. Three training objectives are common:</p>
+
+      <p><strong>Pointwise</strong>: Each (query, document) pair receives an independent relevance label (0/1 or graded). The model trains with binary cross-entropy or MSE. Simple but ignores relative ordering between documents.</p>
+
+      <p><strong>Pairwise</strong>: Given a preferred and rejected document for the same query, the model learns to score the preferred one higher. Structurally similar to the Bradley-Terry reward model from Chapter 11.</p>
+
+      <p><strong>Listwise</strong>: The model scores an entire list of documents simultaneously and optimizes a ranking metric (NDCG) directly. Set-Encoder (2024) extends this with permutation-invariant inter-passage attention — each document's score is informed by the other documents in the list.</p>
+
+      <h3>MonoBERT and MiniLM Rerankers</h3>
+
+      <p><strong>MonoBERT</strong> uses a full BERT-base or BERT-large model for pointwise reranking. Accurate but slow — ~110ms per query at 100 candidates on a single GPU. <strong>MiniLM</strong> rerankers distill MonoBERT into a 6-layer model, achieving 70+ nDCG@10 on the TREC Deep Learning track at 3-5× lower latency. For most applications, MiniLM provides the best quality-latency trade-off.</p>
+
+      <p>Cross-encoders remain competitive against LLM-based rerankers even in 2026. A fine-tuned MiniLM reranker matches or exceeds GPT-4-class listwise reranking on standard benchmarks — at 100× lower cost and latency.</p>
+
+      <h3>The Cascade Architecture</h3>
+
+      <figure class="diagram-figure">
+        <svg width="100%" viewBox="0 0 800 200" xmlns="http://www.w3.org/2000/svg">
+          <text x="400" y="22" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="14" font-weight="600" fill="#1A1A18">Cascade Retrieval: Retrieve → Rank → Rerank → Generate</text>
+
+          <!-- Stage 1 -->
+          <rect x="30" y="56" width="160" height="56" rx="6" fill="#FAEEDA" stroke="#EF9F27" stroke-width="1.5"/>
+          <text x="110" y="78" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#854F0B">BM25 / Dense</text>
+          <text x="110" y="96" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#854F0B">1M → 1000 docs</text>
+          <text x="110" y="108" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#9C9A94">~5 ms</text>
+
+          <line x1="190" y1="84" x2="220" y2="84" stroke="#9C9A94" stroke-width="1.5" marker-end="url(#ch13-arr)"/>
+
+          <!-- Stage 2 -->
+          <rect x="224" y="56" width="160" height="56" rx="6" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1.5"/>
+          <text x="304" y="78" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#534AB7">ColBERT Rerank</text>
+          <text x="304" y="96" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#534AB7">1000 → 100 docs</text>
+          <text x="304" y="108" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#9C9A94">~20 ms</text>
+
+          <line x1="384" y1="84" x2="414" y2="84" stroke="#9C9A94" stroke-width="1.5" marker-end="url(#ch13-arr)"/>
+
+          <!-- Stage 3 -->
+          <rect x="418" y="56" width="160" height="56" rx="6" fill="#FAECE7" stroke="#F0997B" stroke-width="1.5"/>
+          <text x="498" y="78" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#993C1D">Cross-Encoder</text>
+          <text x="498" y="96" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#993C1D">100 → 10 docs</text>
+          <text x="498" y="108" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#9C9A94">~50 ms</text>
+
+          <line x1="578" y1="84" x2="608" y2="84" stroke="#9C9A94" stroke-width="1.5" marker-end="url(#ch13-arr)"/>
+
+          <!-- Stage 4 -->
+          <rect x="612" y="56" width="160" height="56" rx="6" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1.5"/>
+          <text x="692" y="78" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#0F6E56">LLM Generate</text>
+          <text x="692" y="96" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#0F6E56">10 docs → answer</text>
+          <text x="692" y="108" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#9C9A94">~500 ms</text>
+
+          <!-- Cost gradient bar -->
+          <rect x="30" y="140" width="742" height="12" rx="3" fill="none" stroke="#E5E3DC" stroke-width="1"/>
+          <rect x="30" y="140" width="160" height="12" rx="3" fill="#FAEEDA" opacity="0.5"/>
+          <rect x="224" y="140" width="160" height="12" rx="3" fill="#EEEDFE" opacity="0.5"/>
+          <rect x="418" y="140" width="160" height="12" rx="3" fill="#FAECE7" opacity="0.5"/>
+          <rect x="612" y="140" width="160" height="12" rx="3" fill="#E1F5EE" opacity="0.5"/>
+
+          <text x="110" y="170" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#9C9A94">Cheap, broad</text>
+          <text x="692" y="170" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#9C9A94">Expensive, precise</text>
+          <line x1="200" y1="164" x2="620" y2="164" stroke="#9C9A94" stroke-width="1" marker-end="url(#ch13-arr)"/>
+          <text x="400" y="190" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#9C9A94">Cost per document increases, candidate count decreases</text>
+        </svg>
+        <figcaption>Figure 13.6 — The four-stage cascade: a cheap retriever (BM25 or dense) narrows millions of documents to thousands, ColBERT reranks to hundreds, a cross-encoder selects the top 10, and the LLM generates an answer from the final context. Each stage spends more compute per document but sees fewer documents. Total end-to-end latency is under 600ms.</figcaption>
+      </figure>
+
+      <p>Here is a cross-encoder reranker implementation in PyTorch:</p>
+
+<pre><code class="language-python">
+import torch
+import torch.nn as nn
+
+class CrossEncoderReranker(nn.Module):
+    """Cross-encoder: joint query-document scoring via concatenated input."""
+    def __init__(self, backbone, d_model=768):
+        super().__init__()
+        self.backbone = backbone  # BERT or similar encoder
+        self.score_head = nn.Linear(d_model, 1)
+
+    def forward(self, input_ids, attention_mask):
+        """Score a batch of [CLS] q [SEP] d [SEP] inputs.
+
+        input_ids: (B, S) — tokenized query-document concatenations
+        attention_mask: (B, S) — padding mask
+        Returns: (B,) relevance scores
+        """
+        h = self.backbone(input_ids, attention_mask)            # (B, S, d_model)
+        cls_hidden = h[:, 0, :]                                  # (B, d_model)
+        scores = self.score_head(cls_hidden).squeeze(-1)         # (B,)
+        return scores
+
+def rerank(reranker, query_ids, doc_ids_list, tokenizer, top_k=10):
+    """Rerank candidate documents for a single query.
+
+    query_ids: (Q,) tokenized query
+    doc_ids_list: list of (D_i,) tokenized documents
+    Returns: indices of top-k documents after reranking
+    """
+    scores = []
+    for doc_ids in doc_ids_list:
+        # Concatenate: [CLS] query [SEP] doc [SEP]
+        input_ids = torch.cat([
+            torch.tensor([tokenizer.cls_id]),
+            query_ids,
+            torch.tensor([tokenizer.sep_id]),
+            doc_ids,
+            torch.tensor([tokenizer.sep_id])
+        ]).unsqueeze(0)                                          # (1, S)
+        mask = torch.ones_like(input_ids)                        # (1, S)
+        with torch.no_grad():
+            score = reranker(input_ids, mask)                    # (1,)
+        scores.append(score.item())
+    ranked = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
+    return ranked[:top_k]
+</code></pre>
+
+    </section>
+
+    <!-- ================================================================== -->
+    <!-- SECTION 6: RAG PIPELINE ARCHITECTURES                              -->
+    <!-- ================================================================== -->
+    <section class="chapter-section" id="rag-pipelines">
+      <h2>RAG Pipeline Architectures</h2>
+
+      <p>Chapter 12 introduced RAG as memory augmentation. Here we examine how the retrieval pipeline itself has evolved from a simple "retrieve then generate" pattern into sophisticated agentic systems.</p>
+
+      <h3>Naive RAG</h3>
+
+      <p>The simplest RAG pattern: embed the user query, retrieve the top-$k$ chunks from a vector database, concatenate them into the LLM's context, and generate. This works for simple factual questions but fails on multi-hop reasoning, ambiguous queries, and cases where the initial retrieval misses the relevant documents.</p>
+
+      <h3>Advanced RAG: Query Transformation</h3>
+
+      <p><strong>HyDE</strong> (Hypothetical Document Embeddings, Gao et al., 2023) flips the retrieval direction. Instead of embedding the query and searching for similar documents, HyDE first asks the LLM to generate a *hypothetical answer* — a plausible document that would contain the answer. This hypothetical document is then embedded, and similar *real* documents are retrieved. The insight: a hypothetical answer is already in "document space," making it a better search probe than a short query.</p>
+
+      <p><strong>Multi-HyDE</strong> (2025) extends this by generating multiple diverse hypothetical answers, each capturing a different angle on the query. The retrieved results from all hypothetical documents are merged, improving recall on complex questions.</p>
+
+      <p>Other query transformations include <strong>query rewriting</strong> (the LLM rephrases the query for better retrieval), <strong>query decomposition</strong> (splitting a complex question into sub-questions that are retrieved independently), and <strong>step-back prompting</strong> (asking a more general question first to establish context).</p>
+
+      <h3>Modular RAG</h3>
+
+      <p>Modular RAG decomposes the pipeline into pluggable components: router (decides which retriever to use), retriever (sparse, dense, or both), reranker (ColBERT, cross-encoder, or LLM), and generator (with or without citation). Different queries route through different pipeline configurations — a factual question might use BM25 + cross-encoder, while a reasoning question might use dense retrieval + multi-hop chain.</p>
+
+      <h3>Agentic RAG</h3>
+
+      <p>By 2026, <strong>Agentic RAG</strong> is the production standard for complex information needs. The LLM agent controls the entire retrieval process: it decides *whether* to retrieve (maybe the answer is already in context), *what queries* to issue (potentially multiple reformulations), *which tools* to call (web search, vector DB, knowledge graph, SQL database), and *when to stop* (evaluating whether the retrieved context is sufficient to answer confidently).</p>
+
+      <figure class="diagram-figure">
+        <svg width="100%" viewBox="0 0 800 340" xmlns="http://www.w3.org/2000/svg">
+          <text x="400" y="22" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="14" font-weight="600" fill="#1A1A18">Evolution of RAG Architectures</text>
+
+          <!-- Timeline -->
+          <line x1="80" y1="56" x2="720" y2="56" stroke="#C8C6BE" stroke-width="1.5"/>
+
+          <!-- Naive RAG -->
+          <circle cx="140" cy="56" r="6" fill="#F1EFE8" stroke="#C8C6BE" stroke-width="2"/>
+          <text x="140" y="44" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="500" fill="#5C5B56">Naive RAG</text>
+
+          <rect x="60" y="74" width="160" height="90" rx="6" fill="#FFFFFF" stroke="#E5E3DC" stroke-width="1"/>
+          <text x="80" y="94" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#5C5B56">1. Embed query</text>
+          <text x="80" y="110" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#5C5B56">2. Retrieve top-k</text>
+          <text x="80" y="126" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#5C5B56">3. Stuff into context</text>
+          <text x="80" y="142" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#5C5B56">4. Generate</text>
+          <text x="140" y="180" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#9C9A94">Simple, brittle</text>
+
+          <!-- Advanced RAG -->
+          <circle cx="370" cy="56" r="6" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="2"/>
+          <text x="370" y="44" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="500" fill="#534AB7">Advanced RAG</text>
+
+          <rect x="280" y="74" width="180" height="104" rx="6" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1"/>
+          <text x="300" y="94" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#534AB7">1. Query rewrite / HyDE</text>
+          <text x="300" y="110" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#534AB7">2. Hybrid retrieval + RRF</text>
+          <text x="300" y="126" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#534AB7">3. Cross-encoder rerank</text>
+          <text x="300" y="142" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#534AB7">4. Context compression</text>
+          <text x="300" y="158" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#534AB7">5. Generate with citations</text>
+          <text x="370" y="195" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#9C9A94">Better quality, fixed pipeline</text>
+
+          <!-- Agentic RAG -->
+          <circle cx="620" cy="56" r="7" fill="#534AB7" stroke="#EEEDFE" stroke-width="2"/>
+          <text x="620" y="44" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="600" fill="#534AB7">Agentic RAG</text>
+
+          <rect x="530" y="74" width="190" height="120" rx="6" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1.5"/>
+          <text x="550" y="94" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#0F6E56">Agent decides:</text>
+          <text x="550" y="110" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#0F6E56">• Whether to retrieve</text>
+          <text x="550" y="126" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#0F6E56">• Which tools to call</text>
+          <text x="550" y="142" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#0F6E56">• When to retry/reformulate</text>
+          <text x="550" y="158" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#0F6E56">• When enough context</text>
+          <text x="550" y="174" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#0F6E56">• Multi-hop reasoning</text>
+          <text x="620" y="212" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#9C9A94">Dynamic, adaptive, 2026 standard</text>
+
+          <!-- Evolution arrows -->
+          <line x1="230" y1="130" x2="270" y2="130" stroke="#C8C6BE" stroke-width="1.5" marker-end="url(#ch13-arr)"/>
+          <line x1="470" y1="130" x2="520" y2="130" stroke="#C8C6BE" stroke-width="1.5" marker-end="url(#ch13-arr)"/>
+
+          <!-- Embedding model callout -->
+          <rect x="60" y="240" width="660" height="52" rx="6" fill="#F1EFE8" stroke="#C8C6BE" stroke-width="1"/>
+          <text x="390" y="260" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#5C5B56">Embedding Model Choices (MTEB 2026)</text>
+          <text x="390" y="280" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#9C9A94">Cohere embed-v4 (65.2) • OpenAI text-embedding-3-large (64.6) • BGE-M3 (63.0, open-source, multilingual) • Nomic Embed v1 (86.2% top-5 acc)</text>
+        </svg>
+        <figcaption>Figure 13.7 — The evolution of RAG architectures. Naive RAG (left) is a fixed four-step pipeline. Advanced RAG (center) adds query transformation (HyDE), hybrid retrieval, reranking, and citations — but the pipeline is still static. Agentic RAG (right, 2026 standard) gives the LLM agent control over the entire retrieval process: it dynamically decides what to retrieve, when, and how many times. Bottom: current embedding model leaders on the MTEB benchmark.</figcaption>
+      </figure>
+
+      <div class="callout callout-insight">
+        <div class="callout-title">Key Insight</div>
+        <p>The progression from naive to agentic RAG mirrors the progression from instruction-following (Chapter 11) to autonomous reasoning. In both cases, the system evolves from executing a fixed recipe to making dynamic decisions based on intermediate results. The retrieval pipeline becomes a tool that the agent wields, not a script it follows.</p>
+      </div>
+
+    </section>
+
+    <!-- ================================================================== -->
+    <!-- SECTION 7: MULTIMODAL AND CROSS-MODAL RETRIEVAL                    -->
+    <!-- ================================================================== -->
+    <section class="chapter-section" id="multimodal-retrieval">
+      <h2>Multimodal and Cross-Modal Retrieval</h2>
+
+      <p>Text retrieval is the foundation, but production systems increasingly need to search across modalities: find an image given a text description, retrieve code given a natural language query, or locate a specific moment in a video.</p>
+
+      <h3>Image-Text Retrieval with CLIP</h3>
+
+      <p><strong>CLIP</strong> (Contrastive Language-Image Pre-training, Radford et al., 2021) trains a bi-encoder with one arm for images and one for text on 400 million image-text pairs scraped from the web. The contrastive objective pushes matching image-text pairs together in the shared embedding space while pushing non-matching pairs apart — the same InfoNCE loss used for DPR, but across modalities.</p>
+
+      <p>CLIP enables zero-shot image classification (embed a text label, find the closest image embeddings), text-to-image search (embed a description, search an image database), and image-to-text search (embed an image, find matching captions). The shared embedding space means any combination of modalities works without task-specific fine-tuning.</p>
+
+      <figure class="diagram-figure">
+        <svg width="100%" viewBox="0 0 800 240" xmlns="http://www.w3.org/2000/svg">
+          <text x="400" y="22" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="14" font-weight="600" fill="#1A1A18">Cross-Modal Retrieval: Shared Embedding Space</text>
+
+          <!-- Image encoder arm -->
+          <rect x="60" y="50" width="120" height="36" rx="6" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1.5"/>
+          <text x="120" y="73" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#0F6E56">Image Encoder</text>
+          <text x="120" y="44" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#0F6E56">ViT / CLIP</text>
+
+          <!-- Text encoder arm -->
+          <rect x="60" y="110" width="120" height="36" rx="6" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1.5"/>
+          <text x="120" y="133" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#534AB7">Text Encoder</text>
+          <text x="120" y="104" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#534AB7">BERT / GPT</text>
+
+          <!-- Code encoder arm -->
+          <rect x="60" y="170" width="120" height="36" rx="6" fill="#FAEEDA" stroke="#EF9F27" stroke-width="1.5"/>
+          <text x="120" y="193" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#854F0B">Code Encoder</text>
+          <text x="120" y="164" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#854F0B">CodeBERT / UniXcoder</text>
+
+          <!-- Arrows to shared space -->
+          <line x1="180" y1="68" x2="300" y2="100" stroke="#5DCAA5" stroke-width="1.5" marker-end="url(#ch13-arr)"/>
+          <line x1="180" y1="128" x2="300" y2="120" stroke="#AFA9EC" stroke-width="1.5" marker-end="url(#ch13-arr)"/>
+          <line x1="180" y1="188" x2="300" y2="140" stroke="#EF9F27" stroke-width="1.5" marker-end="url(#ch13-arr)"/>
+
+          <!-- Shared embedding space -->
+          <circle cx="450" cy="120" r="100" fill="none" stroke="#E5E3DC" stroke-width="1.5" stroke-dasharray="5 4"/>
+          <text x="450" y="224" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#5C5B56">Shared Embedding Space ℝ^d</text>
+
+          <!-- Dots in shared space -->
+          <circle cx="420" cy="90" r="5" fill="#0F6E56"/>
+          <text x="408" y="84" text-anchor="end" font-family="system-ui, -apple-system, sans-serif" font-size="8" font-weight="400" fill="#0F6E56">🖼 cat photo</text>
+
+          <circle cx="440" cy="98" r="5" fill="#534AB7"/>
+          <text x="455" y="94" font-family="system-ui, -apple-system, sans-serif" font-size="8" font-weight="400" fill="#534AB7">"a photo of a cat"</text>
+
+          <circle cx="480" cy="130" r="5" fill="#854F0B"/>
+          <text x="495" y="126" font-family="system-ui, -apple-system, sans-serif" font-size="8" font-weight="400" fill="#854F0B">sort(list)</text>
+
+          <circle cx="470" cy="142" r="5" fill="#534AB7"/>
+          <text x="485" y="150" font-family="system-ui, -apple-system, sans-serif" font-size="8" font-weight="400" fill="#534AB7">"sort a list"</text>
+
+          <circle cx="410" cy="150" r="4" fill="#C8C6BE"/>
+          <circle cx="490" cy="105" r="4" fill="#C8C6BE"/>
+          <circle cx="430" cy="120" r="4" fill="#C8C6BE"/>
+
+          <!-- Cross-modal search arrows -->
+          <rect x="600" y="60" width="170" height="32" rx="4" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1"/>
+          <text x="685" y="81" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#0F6E56">Text → Image search</text>
+
+          <rect x="600" y="100" width="170" height="32" rx="4" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1"/>
+          <text x="685" y="121" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#534AB7">Text → Code search</text>
+
+          <rect x="600" y="140" width="170" height="32" rx="4" fill="#FAEEDA" stroke="#EF9F27" stroke-width="1"/>
+          <text x="685" y="161" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#854F0B">Code → Text explanation</text>
+        </svg>
+        <figcaption>Figure 13.8 — Cross-modal retrieval maps images, text, and code into a shared embedding space. Similar concepts cluster together regardless of modality — a photo of a cat, the text "a photo of a cat," and nearby image embeddings all live in the same neighborhood. This enables zero-shot cross-modal search: embed a text query, find the nearest image, code snippet, or video clip.</figcaption>
+      </figure>
+
+      <h3>Code Retrieval</h3>
+
+      <p><strong>CodeBERT</strong> (Feng et al., 2020) pre-trains a transformer on paired code-text data (function implementations paired with docstrings). <strong>UniXcoder</strong> (Guo et al., 2022) extends this with a unified encoder-decoder that handles code generation, code summarization, and code retrieval in a single model. Both produce function-level embeddings that enable natural-language-to-code search — "find me a function that sorts a list in descending order" retrieves the right implementation.</p>
+
+      <h3>Video Retrieval</h3>
+
+      <p>Video retrieval adds the dimension of time. The challenge: a 10-minute video may contain the relevant information in a 5-second segment. <strong>Temporal aggregation</strong> strategies include mean-pooling frame embeddings (simple but loses temporal structure), learning temporal position encodings across frames, and hierarchical approaches that first embed segments and then compose them. CLIP-based models applied frame-by-frame with temporal attention layers form the current backbone of video retrieval systems.</p>
+
+    </section>
+
+  </article>
+
+  <footer class="chapter-footer">
+    <div class="footer-nav">
+      <a href="ch12.html">← Previous: Long-Context and Memory Augmentation</a>
+      <a href="ch14.html">Next: Training Language Models at Scale →</a>
+    </div>
+  </footer>
+
+</body>
+</html>

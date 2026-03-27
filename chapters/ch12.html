@@ -1,0 +1,758 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Chapter 12: Long-Context and Memory Augmentation — Transformer Research Book</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <link rel="stylesheet" href="../assets/math.css">
+  <link rel="stylesheet" href="../assets/prism.css">
+  <!-- KaTeX for math rendering -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left: '$$', right: '$$', display: true},
+        {left: '$', right: '$', display: false}
+      ]
+    })">
+  </script>
+  <!-- Prism for code blocks -->
+  <script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/prism.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-python.min.js"></script>
+</head>
+<body>
+  <nav class="chapter-nav">
+    <a href="../index.html" class="nav-home">← Table of Contents</a>
+    <span class="nav-chapter">Chapter 12</span>
+    <div style="display:flex; align-items:center; gap:1rem;">
+      <button class="theme-toggle" onclick="toggleTheme()" aria-label="Toggle dark mode">
+        <span class="icon-moon">&#9789;</span><span class="icon-sun">&#9788;</span>
+      </button>
+      <a href="ch13.html" class="nav-next">Next Chapter →</a>
+    </div>
+  </nav>
+  <script>
+    function toggleTheme() {
+      document.documentElement.classList.toggle('dark');
+      localStorage.setItem('theme', document.documentElement.classList.contains('dark') ? 'dark' : 'light');
+    }
+    if (localStorage.getItem('theme') === 'dark') document.documentElement.classList.add('dark');
+  </script>
+
+  <article class="chapter">
+
+    <header class="chapter-header">
+      <div class="chapter-number">Chapter 12</div>
+      <h1 class="chapter-title">Long-Context and Memory Augmentation</h1>
+      <p class="chapter-lead">In 2023, a 4,096-token context window was standard. By early 2026, Google's Gemini 3 Pro accepts 10 million tokens — a 2,400× expansion in three years. Yet Chroma's "Context Rot" study tested 18 frontier LLMs and found that none of them process their context uniformly: performance degrades as input grows, information in the middle gets lost, and a single distractor sentence can derail retrieval from a million-token haystack. The context window expanded, but the model's ability to *use* it did not keep pace. This chapter traces the engineering and algorithmic innovations that extend context — RoPE interpolation, FlashAttention, Ring Attention — and the parallel development of external memory systems — RAG, knowledge graphs, neural memory modules — that give transformers access to information beyond any fixed window.</p>
+    </header>
+
+    <!-- ================================================================== -->
+    <!-- SECTION 1: THE CONTEXT WINDOW SCALING PROBLEM                      -->
+    <!-- ================================================================== -->
+    <section class="chapter-section" id="context-window-scaling-problem">
+      <h2>The Context Window Scaling Problem</h2>
+
+      <p>Self-attention computes pairwise interactions between every token in the sequence. Double the sequence length and you quadruple the compute: attention costs $O(n^2 d)$ where $n$ is the sequence length and $d$ is the head dimension (matrix multiplication, $\mathbb{R}^{n \times d} \times \mathbb{R}^{d \times n} \to \mathbb{R}^{n \times n}$). Processing 128K tokens costs 16× more than processing 32K tokens — and 1,024× more than processing 4K tokens. That is just the FLOP cost. Memory tells a worse story.</p>
+
+      <h3>The Quadratic Wall</h3>
+
+      <figure class="diagram-figure">
+        <svg width="100%" viewBox="0 0 800 280" xmlns="http://www.w3.org/2000/svg">
+          <text x="400" y="22" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="14" font-weight="600" fill="#1A1A18">Attention Cost Scales Quadratically with Sequence Length</text>
+
+          <!-- 4K panel -->
+          <rect x="40" y="200" width="24" height="24" rx="2" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1"/>
+          <text x="52" y="244" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#534AB7">4K</text>
+          <text x="52" y="258" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#9C9A94">1×</text>
+
+          <!-- 32K panel -->
+          <rect x="130" y="136" width="64" height="64" rx="2" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1.5"/>
+          <text x="162" y="244" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#534AB7">32K</text>
+          <text x="162" y="258" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#9C9A94">64×</text>
+
+          <!-- 128K panel -->
+          <rect x="260" y="72" width="128" height="128" rx="2" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1.5"/>
+          <text x="324" y="140" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="500" fill="#534AB7">128K</text>
+          <text x="324" y="244" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#534AB7">128K</text>
+          <text x="324" y="258" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#9C9A94">1,024×</text>
+
+          <!-- 1M panel -->
+          <rect x="450" y="44" width="180" height="180" rx="2" fill="#534AB7" stroke="#534AB7" stroke-width="1.5"/>
+          <text x="540" y="130" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="14" font-weight="600" fill="#FFFFFF">1M</text>
+          <text x="540" y="150" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#AFA9EC">attention matrix</text>
+          <text x="540" y="244" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#534AB7">1M</text>
+          <text x="540" y="258" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#9C9A94">62,500×</text>
+
+          <!-- 10M label with dashed outline -->
+          <rect x="680" y="44" width="80" height="80" rx="2" fill="none" stroke="#993C1D" stroke-width="1.5" stroke-dasharray="4 3"/>
+          <text x="720" y="80" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="500" fill="#993C1D">10M</text>
+          <text x="720" y="94" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#993C1D">(too large</text>
+          <text x="720" y="106" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#993C1D">to draw)</text>
+          <text x="720" y="244" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#993C1D">10M</text>
+          <text x="720" y="258" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#993C1D">6.25M×</text>
+        </svg>
+        <figcaption>Figure 12.1 — The $n \times n$ attention matrix at different sequence lengths, drawn to relative scale. The area of each square represents compute cost relative to 4K tokens. A 1M-token context costs 62,500× more than a 4K context in raw attention FLOPs. The 10M-token square would be too large to fit on this page.</figcaption>
+      </figure>
+
+      <h3>KV Cache Memory</h3>
+
+      <p>During autoregressive generation, the model stores key and value tensors for every previous token to avoid recomputation (Chapter 6). This <strong>KV cache</strong> grows linearly with sequence length: each new token adds $2 \times L \times H \times d_k$ parameters (2 for K and V, $L$ layers, $H$ heads, $d_k$ head dimension — a counting product, $\mathbb{R}^{2 \times L \times H \times d_k}$). For Llama-3 70B in FP16, the KV cache at 128K tokens consumes roughly 40 GB of VRAM — more than the entire model weights of many smaller LLMs. At 1M tokens it would exceed 300 GB, requiring multi-GPU inference just for the cache.</p>
+
+      <h3>Positional Encoding Extrapolation</h3>
+
+      <p>RoPE (Chapter 4) encodes position by rotating the query and key vectors — each dimension pair rotates at a different frequency determined by the base wavelength. When a model trained on 4K tokens sees position 8,000 for the first time, some of these rotation frequencies produce angles the model has never encountered. The attention scores become unpredictable, and generation quality collapses. This is not a gradual degradation — it is a cliff. A model that writes coherent prose at 4,095 tokens may produce gibberish at 4,097.</p>
+
+      <h3>Long-Context Benchmarks</h3>
+
+      <p>How do we know whether a model actually *uses* its long context, rather than just accepting it? The field has developed increasingly challenging benchmarks:</p>
+
+      <p><strong>Needle in a Haystack (NIAH)</strong> hides a fact inside a long document and asks the model to retrieve it. Most frontier models pass NIAH at all positions and lengths — it is too easy. The model just needs to find a specific sentence.</p>
+
+      <p><strong>RULER</strong> (NVIDIA, 2024) adds multiple needles, distractor needles, and aggregation tasks. Despite perfect NIAH scores, most models fail RULER as input length increases. The gap reveals that "accepts N tokens" does not mean "reasons over N tokens."</p>
+
+      <p><strong>Sequential-NIAH</strong> (2025) requires extracting needles in the correct temporal or logical order. The best-performing model achieved only 63.15% accuracy — a humbling result given that frontier models claim 1M+ token windows.</p>
+
+      <figure class="diagram-figure">
+        <svg width="100%" viewBox="0 0 800 300" xmlns="http://www.w3.org/2000/svg">
+          <defs>
+            <marker id="ch12-arr" viewBox="0 0 10 10" refX="9" refY="5"
+              markerWidth="5" markerHeight="5" orient="auto-start-reverse">
+              <path d="M1 1L9 5L1 9" fill="none" stroke="context-stroke"
+                stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+            </marker>
+          </defs>
+
+          <text x="400" y="22" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="14" font-weight="600" fill="#1A1A18">Context Rot: The "Lost in the Middle" Effect</text>
+
+          <!-- Axes -->
+          <line x1="80" y1="240" x2="720" y2="240" stroke="#C8C6BE" stroke-width="1.5"/>
+          <line x1="80" y1="240" x2="80" y2="50" stroke="#C8C6BE" stroke-width="1.5"/>
+          <text x="400" y="275" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="400" fill="#9C9A94">Position of target information in context →</text>
+          <text x="30" y="145" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="400" fill="#9C9A94" transform="rotate(-90 30 145)">Retrieval accuracy</text>
+
+          <!-- X-axis labels -->
+          <text x="100" y="256" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#9C9A94">Start</text>
+          <text x="400" y="256" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#9C9A94">Middle</text>
+          <text x="700" y="256" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#9C9A94">End</text>
+
+          <!-- Y-axis labels -->
+          <text x="72" y="76" text-anchor="end" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#9C9A94">High</text>
+          <text x="72" y="236" text-anchor="end" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#9C9A94">Low</text>
+
+          <!-- U-shaped curve -->
+          <path d="M100 80 Q150 90 200 130 Q280 180 350 200 Q400 210 450 200 Q520 190 580 150 Q650 105 700 75" stroke="#534AB7" stroke-width="2.5" fill="none"/>
+
+          <!-- Shaded "lost in middle" zone -->
+          <rect x="250" y="140" width="300" height="80" rx="6" fill="#FAECE7" opacity="0.25"/>
+          <text x="400" y="205" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#993C1D">"Lost in the Middle"</text>
+
+          <!-- Annotation arrows -->
+          <text x="100" y="68" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="500" fill="#0F6E56">Primacy</text>
+          <text x="700" y="63" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="500" fill="#0F6E56">Recency</text>
+
+          <!-- Distractors annotation -->
+          <path d="M400 130 Q400 115 400 100" stroke="#993C1D" stroke-width="1" stroke-dasharray="3 2"/>
+          <text x="400" y="92" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#993C1D">Distractors make it worse</text>
+        </svg>
+        <figcaption>Figure 12.2 — The "lost in the middle" phenomenon (Liu et al., 2023; Chroma Context Rot, 2025). Models retrieve information near the start (primacy) and end (recency) of the context much better than information in the middle. Adding distractor content deepens the valley. This U-shaped curve persists across all 18 models tested in the Context Rot study, including those with 1M+ token windows.</figcaption>
+      </figure>
+
+      <div class="callout callout-insight">
+        <div class="callout-title">Key Insight</div>
+        <p>A model's advertised context window is not its effective context window. Chroma's Context Rot study found that models paradoxically perform *better* on shuffled haystacks than logically coherent ones — suggesting that models rely on superficial pattern matching rather than deep reading. The practical lesson: where you place critical information in the prompt matters as much as whether it fits.</p>
+      </div>
+
+      <figure class="diagram-figure">
+        <svg width="100%" viewBox="0 0 800 160" xmlns="http://www.w3.org/2000/svg">
+          <text x="400" y="20" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="14" font-weight="600" fill="#1A1A18">Context Window Timeline</text>
+
+          <!-- Horizontal axis -->
+          <line x1="40" y1="80" x2="760" y2="80" stroke="#C8C6BE" stroke-width="1.5"/>
+
+          <!-- 2020: GPT-3 -->
+          <circle cx="80" cy="80" r="6" fill="#F1EFE8" stroke="#C8C6BE" stroke-width="2"/>
+          <text x="80" y="68" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="500" fill="#5C5B56">GPT-3</text>
+          <text x="80" y="56" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#9C9A94">2K</text>
+          <text x="80" y="100" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#9C9A94">2020</text>
+
+          <!-- 2023: GPT-4 -->
+          <circle cx="220" cy="80" r="6" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="2"/>
+          <text x="220" y="68" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="500" fill="#534AB7">GPT-4</text>
+          <text x="220" y="56" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#9C9A94">32K</text>
+          <text x="220" y="100" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#9C9A94">2023</text>
+
+          <!-- 2024: Claude 3 -->
+          <circle cx="370" cy="80" r="6" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="2"/>
+          <text x="370" y="68" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="500" fill="#534AB7">Claude 3</text>
+          <text x="370" y="56" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#9C9A94">200K</text>
+          <text x="370" y="100" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#9C9A94">2024</text>
+
+          <!-- 2024: Gemini 1.5 -->
+          <circle cx="480" cy="80" r="7" fill="#534AB7" stroke="#EEEDFE" stroke-width="2"/>
+          <text x="480" y="65" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="500" fill="#534AB7">Gemini 1.5</text>
+          <text x="480" y="53" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#534AB7">1M</text>
+          <text x="480" y="100" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#9C9A94">2024</text>
+
+          <!-- 2025: Claude 4 -->
+          <circle cx="590" cy="80" r="7" fill="#534AB7" stroke="#EEEDFE" stroke-width="2"/>
+          <text x="590" y="65" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="500" fill="#534AB7">Claude 4</text>
+          <text x="590" y="53" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#534AB7">1M</text>
+          <text x="590" y="100" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#9C9A94">2025</text>
+
+          <!-- 2026: Gemini 3 / Llama 4 -->
+          <circle cx="720" cy="80" r="8" fill="#993C1D" stroke="#FAECE7" stroke-width="2"/>
+          <text x="720" y="62" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="600" fill="#993C1D">Gemini 3</text>
+          <text x="720" y="50" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#993C1D">10M</text>
+          <text x="720" y="100" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#9C9A94">2026</text>
+
+          <!-- Scale annotation -->
+          <text x="400" y="140" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#9C9A94">2,000 → 10,000,000 tokens: a 5,000× expansion in six years</text>
+        </svg>
+        <figcaption>Figure 12.3 — Context window growth from GPT-3 (2K tokens, 2020) to Gemini 3 Pro and Llama 4 Scout (10M tokens, 2026). Circle size is proportional to the log of the context length. The last two years saw the most dramatic expansion — from 200K to 10M — driven by RoPE interpolation, FlashAttention, and Ring Attention.</figcaption>
+      </figure>
+
+    </section>
+
+    <!-- ================================================================== -->
+    <!-- SECTION 2: EXTENDING CONTEXT WINDOWS                               -->
+    <!-- ================================================================== -->
+    <section class="chapter-section" id="extending-context-windows">
+      <h2>Extending Context Windows</h2>
+
+      <p>The quadratic wall is real, but three classes of innovation have pushed through it: positional encoding tricks that let models generalize beyond their training length, attention algorithms that reduce compute and memory, and distributed techniques that spread long sequences across multiple GPUs.</p>
+
+      <h3>Positional Interpolation (PI)</h3>
+
+      <p>The simplest approach: if the model was trained on positions 0 to $L$, and we want it to handle positions 0 to $L' = sL$, we scale every position index down by $s$. Position 8,000 becomes position $8000/s$, which falls within the training range. Chen et al. (2023) showed this works surprisingly well with minimal fine-tuning.</p>
+
+      <p>The cost: local resolution suffers. Positions that were one step apart in the original encoding are now $1/s$ steps apart in the interpolated encoding. For $s = 4$, adjacent tokens share nearly identical positional embeddings, which can blur short-range attention patterns.</p>
+
+      <h3>NTK-Aware Scaling</h3>
+
+      <p>Not all RoPE frequencies deserve equal interpolation. The key insight from Neural Tangent Kernel theory: high-frequency dimensions encode local relationships (adjacent tokens), while low-frequency dimensions encode global position. NTK-aware scaling applies less interpolation to high frequencies (preserving local resolution) and more to low frequencies (extending range). This distributes the "interpolation pressure" more intelligently, but the optimal base frequency is difficult to find and usually requires expensive grid search.</p>
+
+      <h3>YaRN: The Production Standard</h3>
+
+      <p><strong>YaRN</strong> (Yet another RoPE extensioN, Peng et al., 2023) combines the best ideas. It uses NTK-by-parts interpolation — a piecewise linear function that smoothly transitions between no interpolation (for the highest frequencies) and full interpolation (for the lowest). On top of this, YaRN adds a temperature scaling factor to the attention logits that compensates for the increased dot-product magnitudes at longer sequences.</p>
+
+      <p>YaRN requires 10× fewer tokens and 2.5× fewer training steps than position interpolation. Nearly every major open-weight model family — Qwen, DeepSeek, Llama — uses YaRN for context extension in production.</p>
+
+      <h3>LongRoPE: Per-Dimension Scaling</h3>
+
+      <p><strong>LongRoPE</strong> (Microsoft, 2024) generalizes YaRN further by assigning an independent scaling factor to *every* positional dimension. Where position interpolation uses one scalar $s$, and YaRN uses a piecewise function over frequency bands, LongRoPE uses a learned vector $\mathbf{s} \in \mathbb{R}^{d/2}$ — one scale per rotation pair. This maximizes long-range stability while minimizing short-range degradation. LongRoPE extends context to 2M+ tokens.</p>
+
+      <figure class="diagram-figure">
+        <svg width="100%" viewBox="0 0 800 300" xmlns="http://www.w3.org/2000/svg">
+          <text x="400" y="22" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="14" font-weight="600" fill="#1A1A18">RoPE Scaling Methods Compared</text>
+
+          <!-- Three panels -->
+          <!-- Panel 1: PI -->
+          <rect x="30" y="48" width="230" height="28" rx="5" fill="#FAECE7" stroke="#F0997B" stroke-width="1"/>
+          <text x="145" y="67" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="600" fill="#993C1D">Position Interpolation (PI)</text>
+
+          <!-- Frequency bars - uniform scaling -->
+          <text x="50" y="98" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#9C9A94">High freq</text>
+          <rect x="110" y="88" width="60" height="12" rx="2" fill="#FAECE7" stroke="#F0997B" stroke-width="1"/>
+          <rect x="110" y="88" width="15" height="12" rx="2" fill="#F0997B"/>
+
+          <text x="50" y="118" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#9C9A94">Mid freq</text>
+          <rect x="110" y="108" width="60" height="12" rx="2" fill="#FAECE7" stroke="#F0997B" stroke-width="1"/>
+          <rect x="110" y="108" width="15" height="12" rx="2" fill="#F0997B"/>
+
+          <text x="50" y="138" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#9C9A94">Low freq</text>
+          <rect x="110" y="128" width="60" height="12" rx="2" fill="#FAECE7" stroke="#F0997B" stroke-width="1"/>
+          <rect x="110" y="128" width="15" height="12" rx="2" fill="#F0997B"/>
+
+          <text x="195" y="118" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#993C1D">Uniform ¼×</text>
+          <text x="145" y="168" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#9C9A94">Loses local resolution</text>
+
+          <!-- Panel 2: YaRN -->
+          <rect x="285" y="48" width="230" height="28" rx="5" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1"/>
+          <text x="400" y="67" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="600" fill="#0F6E56">YaRN (NTK-by-parts)</text>
+
+          <!-- Frequency bars - band-wise scaling -->
+          <text x="305" y="98" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#9C9A94">High freq</text>
+          <rect x="365" y="88" width="60" height="12" rx="2" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1"/>
+          <rect x="365" y="88" width="55" height="12" rx="2" fill="#5DCAA5"/>
+
+          <text x="305" y="118" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#9C9A94">Mid freq</text>
+          <rect x="365" y="108" width="60" height="12" rx="2" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1"/>
+          <rect x="365" y="108" width="30" height="12" rx="2" fill="#5DCAA5"/>
+
+          <text x="305" y="138" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#9C9A94">Low freq</text>
+          <rect x="365" y="128" width="60" height="12" rx="2" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1"/>
+          <rect x="365" y="128" width="10" height="12" rx="2" fill="#5DCAA5"/>
+
+          <text x="450" y="118" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#0F6E56">Band-wise</text>
+          <text x="400" y="168" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#9C9A94">Preserves local, extends global</text>
+
+          <!-- Panel 3: LongRoPE -->
+          <rect x="540" y="48" width="230" height="28" rx="5" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1"/>
+          <text x="655" y="67" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="600" fill="#534AB7">LongRoPE (per-dimension)</text>
+
+          <!-- Frequency bars - per-dimension scaling -->
+          <text x="560" y="98" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#9C9A94">Dim 1</text>
+          <rect x="620" y="88" width="60" height="12" rx="2" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1"/>
+          <rect x="620" y="88" width="52" height="12" rx="2" fill="#AFA9EC"/>
+
+          <text x="560" y="118" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#9C9A94">Dim 2</text>
+          <rect x="620" y="108" width="60" height="12" rx="2" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1"/>
+          <rect x="620" y="108" width="25" height="12" rx="2" fill="#AFA9EC"/>
+
+          <text x="560" y="138" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#9C9A94">Dim 3</text>
+          <rect x="620" y="128" width="60" height="12" rx="2" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1"/>
+          <rect x="620" y="128" width="40" height="12" rx="2" fill="#AFA9EC"/>
+
+          <text x="705" y="118" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#534AB7">Learned</text>
+          <text x="655" y="168" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#9C9A94">Optimal per-dim tradeoff</text>
+
+          <!-- Summary row -->
+          <rect x="30" y="190" width="740" height="44" rx="6" fill="#F1EFE8" stroke="#C8C6BE" stroke-width="1"/>
+          <text x="145" y="210" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#5C5B56">1 scalar s</text>
+          <text x="145" y="226" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#9C9A94">4K → 16K</text>
+          <text x="400" y="210" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#5C5B56">Piecewise function over bands</text>
+          <text x="400" y="226" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#9C9A94">4K → 128K (10× fewer tokens)</text>
+          <text x="655" y="210" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#5C5B56">Learned vector s ∈ ℝ^{d/2}</text>
+          <text x="655" y="226" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#9C9A94">4K → 2M+</text>
+
+          <!-- Vertical dividers -->
+          <line x1="270" y1="44" x2="270" y2="240" stroke="#E5E3DC" stroke-width="1" stroke-dasharray="5 4"/>
+          <line x1="525" y1="44" x2="525" y2="240" stroke="#E5E3DC" stroke-width="1" stroke-dasharray="5 4"/>
+
+          <!-- Evolution arrow -->
+          <line x1="160" y1="270" x2="640" y2="270" stroke="#534AB7" stroke-width="1.5" marker-end="url(#ch12-arr)"/>
+          <text x="400" y="290" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#534AB7">Increasing flexibility, decreasing local distortion</text>
+        </svg>
+        <figcaption>Figure 12.4 — Three generations of RoPE scaling. Position Interpolation (left) applies uniform scaling to all frequency dimensions, trading local resolution for range. YaRN (center) uses band-wise scaling — high frequencies keep most of their original resolution, low frequencies are compressed. LongRoPE (right) learns an independent scale per dimension. The bar lengths represent how much of the original frequency is preserved (longer = less distortion).</figcaption>
+      </figure>
+
+      <p>Here is a PyTorch implementation showing the core idea of RoPE interpolation and YaRN-style scaling:</p>
+
+<pre><code class="language-python">
+import torch
+import math
+
+def rope_frequencies(d_model, base=10000.0):
+    """Standard RoPE frequencies: theta_i = base^(-2i/d)."""
+    dim = d_model // 2
+    freqs = 1.0 / (base ** (torch.arange(0, dim).float() / dim))
+    return freqs                                              # (d/2,)
+
+def apply_rope_with_scaling(q, k, positions, freqs, scale_factor=1.0,
+                            method="pi"):
+    """Apply RoPE with different interpolation methods.
+
+    Args:
+        q, k: (batch, seq_len, d_model) query and key tensors
+        positions: (seq_len,) position indices
+        freqs: (d/2,) base frequencies
+        scale_factor: context extension ratio (e.g., 4.0 for 4x extension)
+        method: "pi" (uniform), "ntk" (NTK-aware), or "yarn" (YaRN)
+    """
+    dim = freqs.shape[0]
+    if method == "pi":
+        # Position Interpolation: scale down all positions uniformly
+        positions = positions / scale_factor
+    elif method == "ntk":
+        # NTK-Aware: adjust the base, not positions
+        new_base = 10000.0 * scale_factor ** (dim / (dim - 2))
+        freqs = 1.0 / (new_base ** (torch.arange(0, dim).float() / dim))
+    elif method == "yarn":
+        # YaRN: band-wise — low dims unscaled, high dims interpolated
+        alpha, beta = 1.0, 32.0
+        ramp = torch.clamp((torch.arange(dim).float() - alpha) / (beta - alpha),
+                           0, 1)
+        # ramp=0 → no interpolation; ramp=1 → full interpolation
+        freqs = freqs / (1 + (scale_factor - 1) * ramp)
+
+    # Build rotation angles: position × frequency
+    angles = positions.unsqueeze(-1) * freqs.unsqueeze(0)    # (S, d/2)
+    cos_a, sin_a = angles.cos(), angles.sin()                 # (S, d/2)
+
+    # Apply rotation to query and key (split into pairs)
+    q1, q2 = q[..., :dim], q[..., dim:]                      # (B, S, d/2)
+    k1, k2 = k[..., :dim], k[..., dim:]
+    q_rot = torch.cat([q1 * cos_a - q2 * sin_a,
+                       q1 * sin_a + q2 * cos_a], dim=-1)     # (B, S, d)
+    k_rot = torch.cat([k1 * cos_a - k2 * sin_a,
+                       k1 * sin_a + k2 * cos_a], dim=-1)
+    return q_rot, k_rot
+</code></pre>
+
+      <h3>Sliding Window + Global Attention</h3>
+
+      <p><strong>Longformer</strong> (Beltagy et al., 2020) replaces full $O(n^2)$ attention with local sliding-window attention ($O(n \cdot w)$ for window size $w$) plus global attention on a few designated tokens. Each token attends to its $w$ nearest neighbors — capturing local context efficiently — while global tokens (e.g., the [CLS] token or task-specific markers) attend to all positions.</p>
+
+      <p><strong>Mistral 7B</strong> uses a sliding window of 4,096 tokens in its attention layers, allowing it to process sequences much longer than 4K tokens by having information propagate across windows through multiple layers. After $L$ layers with window $w$, each token's receptive field spans $L \times w$ positions — the window stacks across depth.</p>
+
+      <h3>LongLoRA: Efficient Fine-Tuning for Long Context</h3>
+
+      <p><strong>LongLoRA</strong> (Chen et al., ICLR 2024) makes a surprising observation: while full attention is needed at inference, fine-tuning for context extension can use sparse attention. Its <strong>Shifted Sparse Attention (S²-Attn)</strong> splits the sequence into groups and applies attention within each group independently. In half of the attention heads, tokens are shifted by half the group size — ensuring information flows between adjacent groups. This is implementable in two lines of code during training. At inference, the model uses standard full attention.</p>
+
+      <p>LongLoRA extended Llama 2 7B from 4K to 100K context, and Llama 2 70B to 32K, on a single 8× A100 machine — a dramatic reduction in the hardware barrier for long-context fine-tuning.</p>
+
+      <h3>Infrastructure: FlashAttention-3 and Ring Attention</h3>
+
+      <p>Algorithmic innovations in attention extend how large a context the hardware can handle at each level of the memory hierarchy.</p>
+
+      <p><strong>FlashAttention-3</strong> (Dao et al., 2024) achieves 1.3 PFLOPs/s on H100 GPUs through three techniques: warp-specialization to overlap computation and data movement, interleaved block-wise matmul and softmax, and FP8 block quantization leveraging Hopper hardware support for low-precision arithmetic. FlashAttention is *exact* — it computes the same result as standard attention, but tiles the computation to minimize HBM reads/writes (Chapter 6).</p>
+
+      <p><strong>Ring Attention</strong> distributes attention across multiple GPUs. The key and value tensors are split into chunks, each assigned to a different GPU. During execution, each GPU computes attention for its local query chunk while passing key-value chunks around a ring. After one full rotation, every GPU has attended to all positions.</p>
+
+      <figure class="diagram-figure">
+        <svg width="100%" viewBox="0 0 800 320" xmlns="http://www.w3.org/2000/svg">
+          <text x="400" y="22" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="14" font-weight="600" fill="#1A1A18">Ring Attention: Distributed Long-Context Computation</text>
+
+          <!-- GPU 0 -->
+          <rect x="310" y="50" width="180" height="50" rx="8" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1.5"/>
+          <text x="400" y="72" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="500" fill="#534AB7">GPU 0</text>
+          <text x="400" y="90" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#534AB7">Q₀, K₀, V₀</text>
+
+          <!-- GPU 1 -->
+          <rect x="560" y="140" width="180" height="50" rx="8" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1.5"/>
+          <text x="650" y="162" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="500" fill="#0F6E56">GPU 1</text>
+          <text x="650" y="180" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#0F6E56">Q₁, K₁, V₁</text>
+
+          <!-- GPU 2 -->
+          <rect x="310" y="230" width="180" height="50" rx="8" fill="#FAECE7" stroke="#F0997B" stroke-width="1.5"/>
+          <text x="400" y="252" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="500" fill="#993C1D">GPU 2</text>
+          <text x="400" y="270" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#993C1D">Q₂, K₂, V₂</text>
+
+          <!-- GPU 3 -->
+          <rect x="60" y="140" width="180" height="50" rx="8" fill="#FAEEDA" stroke="#EF9F27" stroke-width="1.5"/>
+          <text x="150" y="162" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="500" fill="#854F0B">GPU 3</text>
+          <text x="150" y="180" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#854F0B">Q₃, K₃, V₃</text>
+
+          <!-- Ring arrows -->
+          <path d="M490 70 Q540 70 560 100 Q575 130 565 140" fill="none" stroke="#534AB7" stroke-width="2" marker-end="url(#ch12-arr)"/>
+          <path d="M650 190 Q650 215 600 235 Q540 260 490 260" fill="none" stroke="#0F6E56" stroke-width="2" marker-end="url(#ch12-arr)"/>
+          <path d="M310 260 Q260 260 240 230 Q225 200 235 190" fill="none" stroke="#993C1D" stroke-width="2" marker-end="url(#ch12-arr)"/>
+          <path d="M150 140 Q150 115 200 95 Q260 70 310 70" fill="none" stroke="#854F0B" stroke-width="2" marker-end="url(#ch12-arr)"/>
+
+          <!-- KV labels on arrows -->
+          <text x="540" y="96" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="500" fill="#534AB7">send K₀V₀</text>
+          <text x="560" y="240" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="500" fill="#0F6E56">send K₁V₁</text>
+          <text x="230" y="240" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="500" fill="#993C1D">send K₂V₂</text>
+          <text x="195" y="96" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="500" fill="#854F0B">send K₃V₃</text>
+
+          <!-- Center annotation -->
+          <text x="400" y="155" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#5C5B56">Each GPU keeps Q local,</text>
+          <text x="400" y="172" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#5C5B56">receives all K/V in rotation</text>
+
+          <!-- Bottom note -->
+          <text x="400" y="306" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#9C9A94">After 4 steps (one full ring rotation): every GPU has attended to all positions</text>
+        </svg>
+        <figcaption>Figure 12.5 — Ring Attention distributes attention across GPUs arranged in a ring. Each GPU holds a chunk of the queries permanently and computes local attention, while key-value chunks circulate around the ring. After one full rotation (N steps for N GPUs), every query has attended to every key. Combined with FlashAttention as the local primitive, this scales to millions of tokens across GPU clusters.</figcaption>
+      </figure>
+
+    </section>
+
+    <!-- ================================================================== -->
+    <!-- SECTION 3: RAG AS MEMORY                                           -->
+    <!-- ================================================================== -->
+    <section class="chapter-section" id="rag-as-memory">
+      <h2>Retrieval-Augmented Generation (RAG) as Memory</h2>
+
+      <p>Instead of fitting everything into the context window, retrieve only what the model needs. Retrieval-Augmented Generation (RAG) treats an external knowledge base as an on-demand memory: the model queries it at generation time, pulling relevant documents into its context before answering. This decouples the model's knowledge horizon from its context window.</p>
+
+      <h3>The RAG Pipeline</h3>
+
+      <figure class="diagram-figure">
+        <svg width="100%" viewBox="0 0 800 220" xmlns="http://www.w3.org/2000/svg">
+          <text x="400" y="22" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="14" font-weight="600" fill="#1A1A18">The RAG Pipeline</text>
+
+          <!-- Step 1: Chunk -->
+          <rect x="30" y="50" width="100" height="44" rx="6" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1.5"/>
+          <text x="80" y="70" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#0F6E56">1. Chunk</text>
+          <text x="80" y="86" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#5C5B56">Split documents</text>
+
+          <line x1="130" y1="72" x2="150" y2="72" stroke="#9C9A94" stroke-width="1.5" marker-end="url(#ch12-arr)"/>
+
+          <!-- Step 2: Embed -->
+          <rect x="154" y="50" width="100" height="44" rx="6" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1.5"/>
+          <text x="204" y="70" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#0F6E56">2. Embed</text>
+          <text x="204" y="86" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#5C5B56">Vector encode</text>
+
+          <line x1="254" y1="72" x2="274" y2="72" stroke="#9C9A94" stroke-width="1.5" marker-end="url(#ch12-arr)"/>
+
+          <!-- Step 3: Index -->
+          <rect x="278" y="50" width="100" height="44" rx="6" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1.5"/>
+          <text x="328" y="70" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#0F6E56">3. Index</text>
+          <text x="328" y="86" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#5C5B56">FAISS / vector DB</text>
+
+          <line x1="378" y1="72" x2="398" y2="72" stroke="#9C9A94" stroke-width="1.5" marker-end="url(#ch12-arr)"/>
+
+          <!-- Step 4: Retrieve -->
+          <rect x="402" y="50" width="100" height="44" rx="6" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1.5"/>
+          <text x="452" y="70" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#534AB7">4. Retrieve</text>
+          <text x="452" y="86" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#5C5B56">Top-k by similarity</text>
+
+          <line x1="502" y1="72" x2="522" y2="72" stroke="#9C9A94" stroke-width="1.5" marker-end="url(#ch12-arr)"/>
+
+          <!-- Step 5: Rerank -->
+          <rect x="526" y="50" width="100" height="44" rx="6" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1.5"/>
+          <text x="576" y="70" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#534AB7">5. Rerank</text>
+          <text x="576" y="86" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#5C5B56">Cross-encoder</text>
+
+          <line x1="626" y1="72" x2="646" y2="72" stroke="#9C9A94" stroke-width="1.5" marker-end="url(#ch12-arr)"/>
+
+          <!-- Step 6: Generate -->
+          <rect x="650" y="50" width="120" height="44" rx="6" fill="#FAECE7" stroke="#F0997B" stroke-width="1.5"/>
+          <text x="710" y="70" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#993C1D">6. Generate</text>
+          <text x="710" y="86" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#5C5B56">LLM + context</text>
+
+          <!-- Query input -->
+          <rect x="370" y="120" width="160" height="32" rx="6" fill="#534AB7" stroke="#534AB7"/>
+          <text x="450" y="141" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#FFFFFF">User query</text>
+          <line x1="452" y1="120" x2="452" y2="94" stroke="#534AB7" stroke-width="1.5" marker-end="url(#ch12-arr)"/>
+
+          <!-- Offline/Online labels -->
+          <rect x="30" y="170" width="348" height="22" rx="4" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1"/>
+          <text x="204" y="185" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="500" fill="#0F6E56">Offline (index once)</text>
+
+          <rect x="402" y="170" width="368" height="22" rx="4" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1"/>
+          <text x="586" y="185" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="500" fill="#534AB7">Online (per query)</text>
+        </svg>
+        <figcaption>Figure 12.6 — The six-stage RAG pipeline. Stages 1-3 (teal) happen offline: documents are chunked, embedded into vectors, and indexed. Stages 4-6 (purple/coral) happen per query: relevant chunks are retrieved by vector similarity, reranked by a cross-encoder for precision, and fed into the LLM as context for generation.</figcaption>
+      </figure>
+
+      <p>Each stage involves design decisions that affect downstream quality. <strong>Chunk size</strong> is the most impactful: smaller chunks (100-200 tokens) give higher retrieval precision but may lack sufficient context for the LLM to reason. Larger chunks (500-1000 tokens) provide more context per hit but dilute the relevant signal with surrounding text. Overlap between chunks (typically 10-20%) ensures that information split across a chunk boundary is still retrievable.</p>
+
+      <p><strong>Late interaction</strong> models like ColBERT (Chapter 13) compute similarity between every query token and every passage token — more expensive than single-vector cosine similarity, but dramatically more precise for nuanced queries. The efficiency-quality curve between bi-encoders (fast, approximate) and cross-encoders (slow, precise) motivates the two-stage retrieve-then-rerank architecture.</p>
+
+      <h3>RAG vs. Long Context</h3>
+
+      <p>With 1M+ token windows available, why bother with RAG? The trade-offs are nuanced:</p>
+
+      <table>
+        <thead>
+          <tr><th>Dimension</th><th>Long Context</th><th>RAG</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><strong>Cost</strong></td><td>Expensive at scale — pay for all tokens</td><td>Cheaper — only retrieved chunks enter the LLM</td></tr>
+          <tr><td><strong>Freshness</strong></td><td>Static snapshot — must reload for updates</td><td>Dynamic — index updates without re-prompting</td></tr>
+          <tr><td><strong>Faithfulness</strong></td><td>Context rot degrades quality over long inputs</td><td>Focused context, but retrieval errors compound</td></tr>
+          <tr><td><strong>Simplicity</strong></td><td>Just stuff it in the prompt</td><td>Pipeline to build and maintain</td></tr>
+          <tr><td><strong>Reasoning</strong></td><td>Can see full document relationships</td><td>May miss cross-document connections</td></tr>
+        </tbody>
+      </table>
+
+      <p>The 2026 consensus is neither pure approach wins. The strongest deployments use a <strong>hybrid architecture</strong>: vector retrieval identifies relevant passages, then a long-context model reasons across the retrieved context. This combination outperforms either approach alone in 7 of 8 enterprise use case categories studied. RAG narrows the haystack; long context handles the reasoning.</p>
+
+      <h3>GraphRAG</h3>
+
+      <p><strong>GraphRAG</strong> (Microsoft, 2024) builds an entity-relation knowledge graph from the corpus before retrieval. Rather than matching raw text chunks to a query, the system traverses graph relationships — following edges from entities mentioned in the query to related facts, even if those facts share no lexical overlap with the query.</p>
+
+      <p>GraphRAG supports two retrieval modes. <strong>Local search</strong> starts from specific entities and follows their immediate neighborhood. <strong>Global search</strong> uses community detection on the knowledge graph, retrieving summaries of entire topic clusters. This is particularly powerful for questions that require synthesizing information across many documents — "What are the main themes in this corpus?" — where traditional chunk-based RAG fails because no single chunk contains the answer.</p>
+
+      <h3>Agentic RAG</h3>
+
+      <p>By 2026, <strong>Agentic RAG</strong> is the baseline for production AI systems. Instead of a fixed pipeline (retrieve → generate), an autonomous agent manages the retrieval process: it decides *when* to retrieve, *what queries* to issue, *whether* the retrieved results are sufficient, and *when to retry* with a reformulated query. The agent uses reflection (evaluating its own retrieval quality), planning (decomposing complex questions into sub-queries), and tool use (calling different retrieval backends for different content types).</p>
+
+      <p>Here is a minimal RAG retrieval implementation using PyTorch embeddings and cosine similarity:</p>
+
+<pre><code class="language-python">
+import torch
+import torch.nn.functional as F
+
+def build_rag_index(chunks, embed_model):
+    """Embed document chunks and build an in-memory index.
+
+    Args:
+        chunks: list of text strings (document fragments)
+        embed_model: encoder that maps text → (d_embed,) vector
+    Returns:
+        index: (N, d_embed) tensor of normalized embeddings
+    """
+    embeddings = []
+    for chunk in chunks:
+        with torch.no_grad():
+            vec = embed_model.encode(chunk)                    # (d_embed,)
+        embeddings.append(vec)
+    index = torch.stack(embeddings)                            # (N, d_embed)
+    index = F.normalize(index, dim=-1)                         # L2 normalize
+    return index
+
+def retrieve_top_k(query, index, embed_model, k=5):
+    """Retrieve top-k chunks by cosine similarity.
+
+    Cosine similarity: q^T d (dot product of normalized vectors, yields scalar).
+    """
+    with torch.no_grad():
+        q_vec = embed_model.encode(query)                      # (d_embed,)
+        q_vec = F.normalize(q_vec.unsqueeze(0), dim=-1)        # (1, d_embed)
+    scores = (q_vec @ index.T).squeeze(0)                      # (N,)
+    top_k = scores.topk(k)                                     # top-k scores + indices
+    return top_k.indices.tolist(), top_k.values.tolist()
+
+# Usage:
+# index = build_rag_index(chunks, embed_model)
+# retrieved_ids, scores = retrieve_top_k("What is attention?", index, embed_model)
+# context = "\n".join([chunks[i] for i in retrieved_ids])
+# answer = llm.generate(f"Context: {context}\nQuestion: What is attention?")
+</code></pre>
+
+      <div class="callout callout-warning">
+        <div class="callout-title">RAG vs. Long Context: When to Use Which</div>
+        <p>Use long context when you need complete reasoning over a bounded, static document (a legal contract, a codebase, a research paper). Use RAG when your knowledge base is large, dynamic, or when you need to control cost at scale. Use the hybrid — RAG-augmented long context — when both conditions apply: large corpus, complex multi-document reasoning.</p>
+      </div>
+
+    </section>
+
+    <!-- ================================================================== -->
+    <!-- SECTION 4: EXTERNAL MEMORY MECHANISMS                              -->
+    <!-- ================================================================== -->
+    <section class="chapter-section" id="external-memory">
+      <h2>External Memory Mechanisms</h2>
+
+      <p>RAG retrieves raw text and stuffs it into the context window. But what if the model could maintain a persistent, structured memory — something more like a database than a document dump? Several architectures give transformers access to information that extends beyond any fixed context window, each with a different trade-off between flexibility, integration depth, and compute cost.</p>
+
+      <h3>MemGPT and Virtual Context Management</h3>
+
+      <p><strong>MemGPT</strong> (Packer et al., 2023) draws a direct analogy to operating system memory management. A computer has limited physical RAM and a larger virtual address space backed by disk. MemGPT gives the LLM a limited "physical context" (its actual window) and an unlimited "virtual context" (an external store). The model uses function calls to *page* information in and out — loading relevant facts from the virtual context when needed and archiving old context when the physical window fills up.</p>
+
+      <p>MemGPT has since evolved into the <strong>Letta</strong> framework — an open-source agent framework for building persistent agents with long-term memory. The core insight remains: the LLM itself decides what to remember and what to forget, using its own judgment about what is relevant to the current conversation.</p>
+
+      <h3>KNN-LM: Nearest-Neighbor Interpolation</h3>
+
+      <p><strong>KNN-LM</strong> (Khandelwal et al., 2020) augments the language model at inference time without any retraining. The idea: build a datastore of (context, next-token) pairs from a large corpus, then at each generation step, interpolate between the LM's own distribution and a k-nearest neighbor distribution over the datastore.</p>
+
+      <p>The interpolated distribution is:</p>
+
+      $$p(y | x) = \lambda \, p_{\text{kNN}}(y | x) + (1 - \lambda) \, p_{\text{LM}}(y | x)$$
+
+      <p>where $\lambda$ is a mixing coefficient (scalar multiplication — $\lambda$ scales the kNN probability, $1 - \lambda$ scales the LM probability). The kNN distribution $p_{\text{kNN}}$ is computed from the distances between the current hidden state and the stored contexts in the datastore: closer neighbors get higher weight via a softmax over negative distances.</p>
+
+      <p>Here is a simplified KNN-LM interpolation step in PyTorch:</p>
+
+<pre><code class="language-python">
+import torch
+import torch.nn.functional as F
+
+def knn_lm_step(hidden, lm_logits, datastore_keys, datastore_vals,
+                k=64, temperature=10.0, lam=0.25):
+    """Interpolate LM distribution with kNN distribution.
+
+    Args:
+        hidden: (d_model,) current hidden state from the LM
+        lm_logits: (vocab_size,) raw logits from the LM head
+        datastore_keys: (N, d_model) stored hidden states
+        datastore_vals: (N,) corresponding next-token IDs
+        k: number of nearest neighbors
+        temperature: softmax temperature for kNN distances
+        lam: interpolation weight for kNN (0 = pure LM, 1 = pure kNN)
+    """
+    # Find k nearest neighbors by L2 distance
+    dists = torch.cdist(hidden.unsqueeze(0),
+                        datastore_keys).squeeze(0)             # (N,)
+    topk = dists.topk(k, largest=False)                        # smallest distances
+    nn_dists = topk.values                                     # (k,)
+    nn_tokens = datastore_vals[topk.indices]                    # (k,)
+
+    # kNN distribution: softmax over negative distances
+    knn_weights = F.softmax(-nn_dists / temperature, dim=0)    # (k,)
+    knn_probs = torch.zeros(lm_logits.shape[0])                # (vocab_size,)
+    knn_probs.scatter_add_(0, nn_tokens, knn_weights)
+
+    # LM distribution
+    lm_probs = F.softmax(lm_logits, dim=0)                    # (vocab_size,)
+
+    # Interpolate: scalar × vector + scalar × vector
+    final_probs = lam * knn_probs + (1 - lam) * lm_probs
+    return final_probs
+</code></pre>
+
+      <p>KNN-LM is powerful because it requires zero additional training — you build the datastore from any corpus and plug it in. Domain adaptation becomes trivial: swap the datastore, not the model.</p>
+
+      <h3>RETRO: Retrieval Integrated into Training</h3>
+
+      <p><strong>RETRO</strong> (Borgeaud et al., 2022) goes further than KNN-LM by integrating retrieval into the model architecture itself. Every few layers, RETRO cross-attends over retrieved chunks from a database. The retrieval is performed using the model's own intermediate representations, meaning the model learns *what* to retrieve as part of its training process.</p>
+
+      <p>The result: a 7.5B parameter RETRO model matches the performance of a 175B parameter model that relies on parametric knowledge alone — a 25× parameter reduction. The external database acts as an efficient storage for factual knowledge, freeing the model's parameters to focus on reasoning and language generation.</p>
+
+      <h3>Memorizing Transformers</h3>
+
+      <p><strong>Memorizing Transformers</strong> (Wu et al., 2022) cache the key-value activations from previous forward passes in an external memory. At each generation step, the model attends over both its current context and the cached activations from prior contexts using approximate nearest-neighbor search. This is functionally similar to extending the KV cache across conversation turns or even across documents — without the quadratic cost of attending to all prior tokens with full attention.</p>
+
+      <h3>Titans: Neural Long-Term Memory</h3>
+
+      <p><strong>Titans</strong> (Google Research, January 2025) introduces a fundamentally different approach: a learned neural memory module that updates its weights *while processing the input*. The memory is a small multi-layer perceptron (MLP) whose parameters are modified by gradient descent at test time — not during training of the main model, but during each forward pass as the model reads new tokens.</p>
+
+      <p>The architecture pairs two systems. <strong>Attention</strong> acts as short-term memory — precise but bounded by the context window. The <strong>neural memory module</strong> acts as long-term memory — it compresses historical context into its weights, providing a persistent representation that extends far beyond the attention window. The model learns which information to store in the neural memory and which to handle with attention.</p>
+
+      <figure class="diagram-figure">
+        <svg width="100%" viewBox="0 0 800 340" xmlns="http://www.w3.org/2000/svg">
+          <text x="400" y="22" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="14" font-weight="600" fill="#1A1A18">Titans: Attention (Short-Term) + Neural Memory (Long-Term)</text>
+
+          <!-- Input tokens -->
+          <rect x="240" y="50" width="320" height="32" rx="6" fill="#F1EFE8" stroke="#C8C6BE" stroke-width="1"/>
+          <text x="400" y="71" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="500" fill="#5C5B56">Input Token Sequence</text>
+
+          <!-- Fork -->
+          <line x1="400" y1="82" x2="400" y2="100" stroke="#9C9A94" stroke-width="1.5"/>
+          <line x1="200" y1="100" x2="600" y2="100" stroke="#9C9A94" stroke-width="1.5"/>
+          <line x1="200" y1="100" x2="200" y2="118" stroke="#9C9A94" stroke-width="1.5" marker-end="url(#ch12-arr)"/>
+          <line x1="600" y1="100" x2="600" y2="118" stroke="#9C9A94" stroke-width="1.5" marker-end="url(#ch12-arr)"/>
+
+          <!-- Attention module (short-term) -->
+          <rect x="80" y="120" width="240" height="100" rx="8" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1.5"/>
+          <text x="200" y="146" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="600" fill="#534AB7">Attention (Short-Term)</text>
+          <text x="200" y="166" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#534AB7">Precise token-to-token</text>
+          <text x="200" y="182" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#534AB7">Current context window</text>
+          <rect x="120" y="194" width="160" height="18" rx="3" fill="#AFA9EC" opacity="0.5"/>
+          <text x="200" y="207" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#534AB7">Fixed window (e.g., 4K tokens)</text>
+
+          <!-- Neural memory module (long-term) -->
+          <rect x="480" y="120" width="240" height="100" rx="8" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1.5"/>
+          <text x="600" y="146" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="600" fill="#0F6E56">Neural Memory (Long-Term)</text>
+          <text x="600" y="166" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#0F6E56">MLP weights updated by</text>
+          <text x="600" y="182" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#0F6E56">gradient descent at test time</text>
+          <rect x="520" y="194" width="160" height="18" rx="3" fill="#5DCAA5" opacity="0.5"/>
+          <text x="600" y="207" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#0F6E56">Unlimited history (compressed)</text>
+
+          <!-- Merge -->
+          <line x1="200" y1="220" x2="200" y2="250" stroke="#534AB7" stroke-width="1.5" marker-end="url(#ch12-arr)"/>
+          <line x1="600" y1="220" x2="600" y2="250" stroke="#0F6E56" stroke-width="1.5" marker-end="url(#ch12-arr)"/>
+
+          <rect x="120" y="252" width="560" height="40" rx="6" fill="#FAECE7" stroke="#F0997B" stroke-width="1.5"/>
+          <text x="400" y="270" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="500" fill="#993C1D">Combine: gate selects short-term vs long-term per token</text>
+          <text x="400" y="286" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#993C1D">Recent detail from attention, historical context from neural memory</text>
+
+          <!-- Output -->
+          <line x1="400" y1="292" x2="400" y2="314" stroke="#9C9A94" stroke-width="1.5" marker-end="url(#ch12-arr)"/>
+          <text x="400" y="332" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#5C5B56">Output: captures both immediate context and distant history</text>
+        </svg>
+        <figcaption>Figure 12.7 — The Titans architecture (Google, 2025). Input tokens are processed by two parallel systems: attention (purple, left) provides precise short-term memory over the current window, while a neural memory module (teal, right) maintains compressed long-term memory by updating its MLP weights via gradient descent as it reads. A gating mechanism selects how much each token relies on short-term vs. long-term memory. Titans scale to 2M+ tokens, outperforming both standard Transformers and Mamba-2.</figcaption>
+      </figure>
+
+      <p>Titans outperform standard Transformers, Mamba-2, and Gated DeltaNet on language modeling, commonsense reasoning, genomics, and time series tasks. Google's follow-up <strong>MIRAS</strong> framework (December 2025) builds on Titans with several variants (YAAD, MONETA, MEMORA), establishing neural memory as a first-class component of next-generation sequence models.</p>
+
+      <h3>KV Cache Optimization</h3>
+
+      <p>Every approach discussed so far either extends the context window or adds external memory. A complementary strategy: make the KV cache itself cheaper to store. Recent innovations have dramatically reduced the memory cost of long-context inference:</p>
+
+      <ul>
+        <li><strong>FP8 quantization</strong>: Storing KV cache in 8-bit floating point reduces memory by 75% in Llama-3.1-8B without meaningful quality loss. Frameworks like vLLM support this natively.</li>
+        <li><strong>TurboQuant</strong> (ICLR 2026): Pushes further with 3-bit keys and 2-bit values, achieving 2.6× compression per layer — storing each token in approximately 198 bytes versus 512 bytes in BF16.</li>
+        <li><strong>PagedAttention</strong> (vLLM): Borrows paging from OS memory management — allocates KV cache in fixed-size blocks rather than contiguous arrays, reducing waste to under 4% and enabling 2-4× throughput improvement.</li>
+        <li><strong>PagedEviction</strong>: Fine-grained structured pruning of KV cache blocks, dropping the least important blocks as context grows.</li>
+      </ul>
+
+      <p>These optimizations compose with all the context extension techniques above. A model with YaRN context scaling, FlashAttention-3 for compute efficiency, FP8 KV cache quantization, and PagedAttention for memory management can serve 128K-token contexts at costs that were impractical for 8K contexts two years ago.</p>
+
+    </section>
+
+  </article>
+
+  <footer class="chapter-footer">
+    <div class="footer-nav">
+      <a href="ch11.html">← Previous: Instruction Tuning, RLHF, and Alignment</a>
+      <a href="ch13.html">Next: Retrieval and Ranking with Transformers →</a>
+    </div>
+  </footer>
+
+</body>
+</html>

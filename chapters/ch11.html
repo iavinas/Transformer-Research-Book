@@ -477,13 +477,103 @@ def ppo_step(policy, sequences, old_logp, advantages, clip_eps=0.2):
 
       <h3>RLHF at Scale</h3>
 
-      <p>Different labs have adopted different approaches to RLHF at production scale:</p>
+      <p>Different labs have adopted different approaches to RLHF at production scale, and the landscape has shifted dramatically since InstructGPT:</p>
 
-      <p><strong>OpenAI</strong> (InstructGPT, GPT-4) uses PPO with extensive human annotation pipelines. Thousands of human annotators write demonstrations and compare model outputs. Red-teaming — deliberately trying to elicit harmful outputs — is a critical part of the annotation process.</p>
+      <p><strong>OpenAI</strong> evolved from PPO-based RLHF (InstructGPT, GPT-4) to RL for reasoning (o1, o3, o4-mini). The reasoning models use RL with process-level rewards — scoring intermediate reasoning steps, not just final answers. Thousands of human annotators still write demonstrations and red-team model outputs.</p>
 
-      <p><strong>Anthropic</strong> (Claude family) combines RLHF with Constitutional AI (Section 4), using the model itself to generate preference labels guided by a set of principles. This reduces the need for human annotators while maintaining alignment quality.</p>
+      <p><strong>Anthropic</strong> (Claude family) combines RLHF with Constitutional AI (Section 4), using the model itself to generate preference labels guided by a set of principles. This reduces the need for human annotators while maintaining alignment quality at scale.</p>
 
-      <p><strong>Google DeepMind</strong> (Gemini) uses rule-based reward models alongside human preferences, with adversarial probing to identify failure modes. The LLaMA 2-Chat models (Chapter 8) used rejection sampling alongside PPO, demonstrating that RLHF could be applied effectively to open-source models.</p>
+      <p><strong>DeepSeek</strong> introduced GRPO (Group Relative Policy Optimization) for DeepSeek-R1, eliminating the critic model entirely. Their key insight: bypass SFT before RL training, letting the model discover reasoning patterns through unconstrained exploration with verifiable rewards.</p>
+
+      <p><strong>Meta</strong> (Llama 3) open-sourced a complete post-training recipe including rejection sampling alongside PPO, demonstrating that effective alignment does not require proprietary infrastructure.</p>
+
+      <p>The trend is clear: there is no longer a single "RLHF recipe." Production post-training stacks are modular — SFT for instruction format, preference optimization (DPO/SimPO/KTO) for general alignment, and RL with verifiable rewards (GRPO/DAPO) for reasoning capabilities. The next subsection examines the RL algorithms that made this modular stack possible.</p>
+
+      <h3>Beyond PPO: The Modern RL Landscape</h3>
+
+      <p>PPO requires four models in memory (policy, reference policy, reward model, value function) and suffers from training instability at scale. By 2025, the field converged on simpler RL algorithms that eliminate the critic model while matching or exceeding PPO's performance.</p>
+
+      <p><strong>GRPO</strong> (Group Relative Policy Optimization, DeepSeek, 2025) samples a group of $G$ responses for each prompt and computes advantages by normalizing each response's reward against the group mean and standard deviation — no separate value function needed:</p>
+
+      $$\hat{A}_i = \frac{r_i - \text{mean}(\{r_1, \ldots, r_G\})}{\text{std}(\{r_1, \ldots, r_G\})}$$
+
+      <p>where $r_i$ is the reward for the $i$-th response in the group (scalar output of the reward model or a verifiable checker). This reduces memory by ~50% compared to PPO. Recent theoretical analysis shows GRPO's policy gradient is asymptotically equivalent to an oracle algorithm with access to an ideal value function.</p>
+
+      <p><strong>DAPO</strong> (Dynamic Alignment with Policy Optimization) addresses stability challenges in long-horizon reasoning through four innovations: Clip-Higher (preventing entropy collapse), Dynamic Sampling (filtering uninformative batches), Token-level Policy Gradient Loss (handling vanishing gradients in lengthy chains-of-thought), and Overlong Reward Shaping (reducing noise from oversized responses). DAPO trained Qwen2.5-32B to 50 points on AIME, outperforming DeepSeek-R1-Zero with 50% fewer training steps.</p>
+
+      <p><strong>RLVR</strong> (Reinforcement Learning with Verifiable Rewards) is the most consequential shift: replacing human preference labels with automated verification. Unit tests score code, proof checkers verify math, and format validators check structured output. DeepSeek-R1 demonstrated that pure RLVR — without any human preference annotation — can produce emergent reasoning capabilities including self-reflection, strategy switching, and "aha moment" backtracking.</p>
+
+      <figure class="diagram-figure">
+        <svg width="100%" viewBox="0 0 800 340" xmlns="http://www.w3.org/2000/svg">
+          <text x="400" y="22" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="14" font-weight="600" fill="#1A1A18">The Modern Post-Training Stack (2025-2026)</text>
+
+          <!-- Stage 1: Base Model -->
+          <rect x="40" y="60" width="130" height="48" rx="6" fill="#F1EFE8" stroke="#C8C6BE" stroke-width="1"/>
+          <text x="105" y="80" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#5C5B56">Base Model</text>
+          <text x="105" y="96" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#9C9A94">next-token predictor</text>
+
+          <line x1="170" y1="84" x2="196" y2="84" stroke="#9C9A94" stroke-width="1.5" marker-end="url(#ch11-arr)"/>
+
+          <!-- Stage 2: SFT -->
+          <rect x="200" y="60" width="130" height="48" rx="6" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1.5"/>
+          <text x="265" y="80" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#0F6E56">SFT</text>
+          <text x="265" y="96" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#0F6E56">instruction format</text>
+
+          <line x1="330" y1="84" x2="356" y2="84" stroke="#9C9A94" stroke-width="1.5" marker-end="url(#ch11-arr)"/>
+
+          <!-- Stage 3: Preference Optimization -->
+          <rect x="360" y="60" width="160" height="48" rx="6" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1.5"/>
+          <text x="440" y="80" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#534AB7">Preference Opt.</text>
+          <text x="440" y="96" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#534AB7">DPO / SimPO / KTO</text>
+
+          <line x1="520" y1="84" x2="546" y2="84" stroke="#9C9A94" stroke-width="1.5" marker-end="url(#ch11-arr)"/>
+
+          <!-- Stage 4: RL with Verifiable Rewards -->
+          <rect x="550" y="54" width="210" height="60" rx="6" fill="#FAECE7" stroke="#F0997B" stroke-width="1.5"/>
+          <text x="655" y="76" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#993C1D">RL + Verifiable Rewards</text>
+          <text x="655" y="94" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#993C1D">GRPO / DAPO</text>
+          <text x="655" y="108" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#9C9A94">(math, code, reasoning)</text>
+
+          <!-- Comparison: 2022 vs 2026 -->
+          <rect x="40" y="140" width="720" height="1" rx="0" fill="#E5E3DC"/>
+
+          <!-- 2022 label -->
+          <rect x="40" y="160" width="80" height="22" rx="4" fill="#F1EFE8" stroke="#C8C6BE" stroke-width="1"/>
+          <text x="80" y="175" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="600" fill="#5C5B56">2022</text>
+          <text x="140" y="175" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#5C5B56">SFT → Reward Model → PPO (InstructGPT)</text>
+
+          <!-- 2025 label -->
+          <rect x="40" y="192" width="80" height="22" rx="4" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1"/>
+          <text x="80" y="207" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="600" fill="#534AB7">2025</text>
+          <text x="140" y="207" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#534AB7">SFT → Preference Opt → RLVR (modular, task-specific)</text>
+
+          <!-- Algorithm comparison table -->
+          <rect x="40" y="240" width="720" height="90" rx="6" fill="#FFFFFF" stroke="#E5E3DC" stroke-width="1"/>
+          <!-- Headers -->
+          <text x="140" y="260" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="600" fill="#1A1A18">Algorithm</text>
+          <text x="310" y="260" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="600" fill="#1A1A18">Critic Model?</text>
+          <text x="470" y="260" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="600" fill="#1A1A18">Reward Source</text>
+          <text x="650" y="260" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="600" fill="#1A1A18">Used By</text>
+          <line x1="50" y1="268" x2="750" y2="268" stroke="#E5E3DC" stroke-width="1"/>
+          <!-- PPO row -->
+          <text x="140" y="285" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#5C5B56">PPO</text>
+          <text x="310" y="285" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#993C1D">Yes (4 models)</text>
+          <text x="470" y="285" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#5C5B56">Learned RM</text>
+          <text x="650" y="285" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#5C5B56">InstructGPT, GPT-4</text>
+          <!-- GRPO row -->
+          <text x="140" y="302" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#5C5B56">GRPO</text>
+          <text x="310" y="302" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#0F6E56">No (2 models)</text>
+          <text x="470" y="302" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#5C5B56">Verifiable / RM</text>
+          <text x="650" y="302" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#5C5B56">DeepSeek-R1</text>
+          <!-- DAPO row -->
+          <text x="140" y="319" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#5C5B56">DAPO</text>
+          <text x="310" y="319" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#0F6E56">No (2 models)</text>
+          <text x="470" y="319" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#5C5B56">Verifiable</text>
+          <text x="650" y="319" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#5C5B56">Qwen2.5</text>
+        </svg>
+        <figcaption>Figure 11.5 — The modern post-training stack (2025-2026). Top: the modular pipeline — each stage targets a different capability (instruction following, general alignment, reasoning). Bottom: the evolution from InstructGPT's monolithic PPO pipeline to a modular, task-specific approach. The algorithm table compares PPO, GRPO, and DAPO on architecture requirements, reward source, and production usage.</figcaption>
+      </figure>
+
     </section>
 
     <!-- ================================================================== -->
@@ -557,7 +647,7 @@ def ppo_step(policy, sequences, old_logp, advantages, clip_eps=0.2):
           <text x="595" y="240" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#9C9A94">1 model, 1 loss function,</text>
           <text x="595" y="256" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#9C9A94">standard gradient descent</text>
         </svg>
-        <figcaption>Figure 11.5 — RLHF (left) requires training a reward model, then running an RL loop with PPO. DPO (right) skips both — the same preference data is used directly as a supervised learning objective. The crossed-out reward model is the key simplification: DPO proves the reward is implicitly defined by the policy itself.</figcaption>
+        <figcaption>Figure 11.6 — RLHF (left) requires training a reward model, then running an RL loop with PPO. DPO (right) skips both — the same preference data is used directly as a supervised learning objective. The crossed-out reward model is the key simplification: DPO proves the reward is implicitly defined by the policy itself.</figcaption>
       </figure>
 
       <h3>The DPO Loss</h3>
@@ -622,13 +712,23 @@ def dpo_loss(policy, ref_policy, chosen_ids, rejected_ids, beta=0.1):
         </tbody>
       </table>
 
-      <p>The trend is clear: each variant removes one more component from the pipeline. ORPO is the most minimal — it requires only preference data and a single training stage, combining language modeling with an odds-ratio penalty that discourages generating rejected responses.</p>
+      <p>Each variant removes one more component from the pipeline. The differences matter in practice:</p>
 
-      <h3>When PPO Still Wins</h3>
+      <p><strong>IPO</strong> (Identity Preference Optimization) replaces DPO's log-sigmoid loss with a squared hinge loss. DPO's gradient on "easy" pairs — where the preferred response is already much more likely — vanishes, so the model stops learning from them. IPO's hinge loss maintains a constant gradient regardless of the margin, preventing the model from overfitting to trivially distinguishable pairs while underfitting on harder ones.</p>
 
-      <p>DPO is simpler and more stable, but PPO has advantages in specific regimes. Complex instruction following, mathematics, and coding — domains where the reward signal is sparse and can be verified programmatically — tend to favor PPO. The key difference is <strong>on-policy exploration</strong>: PPO generates new responses during training and learns from them, while DPO trains on a fixed preference dataset. When the distribution of good responses is narrow (as in mathematical proofs or correct code), the ability to explore diverse solution paths during training matters.</p>
+      <p><strong>KTO</strong> (Kahneman-Tversky Optimization) eliminates the need for *paired* preferences entirely. Most production feedback is binary — a thumbs-up or thumbs-down on individual responses, not a side-by-side comparison of two. KTO works with this unpaired signal. Inspired by prospect theory, it weights losses asymmetrically: the penalty for generating a bad response is larger than the reward for generating a good one. This matches human psychology — users punish bad answers more than they reward good ones.</p>
 
-      <p>The reasoning models from Chapter 8 — o1, o3, and DeepSeek R1 — all rely on RL-based training, not DPO. When the task requires extended chains of reasoning, with verification at each step, on-policy RL appears critical for learning the exploration-exploitation balance that produces correct solution paths.</p>
+      <p><strong>SimPO</strong> (Simple Preference Optimization) eliminates the reference model by using the average log-probability of the response under the current policy as an implicit reward. Where DPO computes the log-ratio $\log(\pi_\theta / \pi_{\text{ref}})$, SimPO uses $\frac{1}{|y|}\sum_t \log \pi_\theta(y_t | y_{&lt;t}, x)$ — the length-normalized generation probability. This also fixes DPO's tendency to favor longer responses (longer text naturally has lower total log-prob). SimPO outperforms DPO by 6.4 points on AlpacaEval 2 and 7.5 points on Arena-Hard.</p>
+
+      <p><strong>ORPO</strong> (Odds Ratio Preference Optimization) is the most radical simplification: it combines SFT and preference optimization into a single training stage. The standard cross-entropy loss teaches the model to generate good responses, while an odds-ratio penalty simultaneously discourages generating rejected responses. One stage instead of two eliminates the distribution shift that occurs between SFT and preference tuning — the model never has to "unlearn" patterns from a separate SFT phase.</p>
+
+      <h3>When On-Policy RL Still Wins</h3>
+
+      <p>DPO is simpler and more stable, but on-policy RL has decisive advantages for reasoning tasks. The key difference is <strong>on-policy exploration</strong>: RL generates new responses during training and learns from them, while DPO trains on a fixed preference dataset. When the distribution of correct solutions is narrow — as in mathematical proofs, competitive programming, or multi-step reasoning — the ability to explore diverse solution paths during training is critical.</p>
+
+      <p>DeepSeek-R1 demonstrated this most dramatically. Trained with GRPO using only verifiable rewards (correctness of final answers + format compliance), the model developed emergent reasoning behaviors *not present in its training data*: self-reflection ("Wait, let me reconsider..."), backtracking to previous reasoning steps, and dynamic strategy switching mid-solution. These behaviors emerged purely from RL exploration — no human demonstrated them. DeepSeek's key design choice was to skip SFT before RL entirely, on the hypothesis that human-defined reasoning patterns would limit the model's exploration of novel solution strategies.</p>
+
+      <p>The practical dividing line: use DPO/SimPO/KTO for general alignment (helpfulness, safety, style) where the preference dataset covers the relevant behaviors well. Use on-policy RL (GRPO/DAPO) for reasoning, math, and code where correctness is verifiable and the solution space is too large for a static preference dataset to cover.</p>
     </section>
 
     <!-- ================================================================== -->
@@ -712,7 +812,7 @@ def dpo_loss(policy, ref_policy, chosen_ids, rejected_ids, beta=0.1):
           <text x="400" y="298" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="500" fill="#5C5B56">Write principles once → scale to millions of preference labels automatically</text>
           <text x="400" y="316" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#9C9A94">Cost: ~$0.01/pair (AI) vs ~$1-3/pair (human annotators)</text>
         </svg>
-        <figcaption>Figure 11.6 — Constitutional AI operates in two phases. Phase 1 (left): the model generates, self-critiques against a set of principles, and revises. Phase 2 (right): the AI compares original vs. revised responses to generate preference labels, which are used for RLHF or DPO training. The constitution is written once and scales to millions of comparisons.</figcaption>
+        <figcaption>Figure 11.7 — Constitutional AI operates in two phases. Phase 1 (left): the model generates, self-critiques against a set of principles, and revises. Phase 2 (right): the AI compares original vs. revised responses to generate preference labels, which are used for RLHF or DPO training. The constitution is written once and scales to millions of comparisons.</figcaption>
       </figure>
 
       <h3>RLAIF: LLM as Preference Labeler</h3>
@@ -723,17 +823,19 @@ def dpo_loss(policy, ref_policy, chosen_ids, rejected_ids, beta=0.1):
 
       <p><strong>SPIN</strong> (Chen et al., 2024) takes the self-improvement idea further: the model plays against itself. In each iteration, the model tries to distinguish its own generated text from human-written text. The "real" label goes to human demonstrations, and the "fake" label goes to the model's own outputs. After training, the model improves, making the discrimination task harder in the next round. This iterative process is structurally similar to GAN training applied to language model alignment.</p>
 
+      <p>A practical challenge: constitutional AI can suffer from <strong>model collapse</strong> when training on recursively generated data. If the model's self-critiques are systematically wrong — or if the revised responses converge to a narrow stylistic mode — each round of self-improvement degrades quality. Smaller models are more susceptible: their self-critique quality is lower, producing a feedback loop that amplifies errors. The C3AI framework (2025) addresses this by providing structured methods for crafting and evaluating constitutions — treating the constitution itself as an artifact that requires systematic design and testing.</p>
+
       <h3>Scalable Oversight</h3>
 
       <p>As AI systems become more capable, human oversight becomes the bottleneck. How do you align a model that is smarter than you on the task being evaluated? This is the <strong>scalable oversight</strong> problem, and several research directions are being explored:</p>
 
       <ul>
-        <li><strong>Weak-to-strong generalization</strong> (Burns et al., 2023): a small model supervises a large model. Surprisingly, the large model can sometimes generalize *beyond* the quality of the supervisor.</li>
-        <li><strong>Debate</strong> (Irving et al., 2018): two AI systems argue opposing positions; a human judge picks the winner. Even a weak judge can identify the more truthful argument when it is presented alongside a challenge.</li>
+        <li><strong>Weak-to-strong generalization</strong> (Burns et al., 2023): a small model supervises a large model. Surprisingly, the large model can sometimes generalize *beyond* the quality of the supervisor. However, by mid-2025 benchmarks show that weak-to-strong methods improve oversight fidelity only in narrow domains — generalization to open-ended tasks remains unproven, and risks of deceptive behaviors that evade less capable evaluators persist.</li>
+        <li><strong>Debate</strong> (Irving et al., 2018): two AI systems argue opposing positions; a human judge picks the winner. Even a weak judge can identify the more truthful argument when it is presented alongside a challenge. Recent theoretical work (2025) shows that same-weight debate — where both debaters share identical parameters — collapses to a degenerate case where debate loses its advantage over direct evaluation.</li>
         <li><strong>Amplification</strong> (Christiano et al., 2018): decompose hard oversight tasks into simpler subtasks that humans *can* evaluate accurately.</li>
       </ul>
 
-      <p>These are frontier research directions — not deployed at production scale — but they point toward a future where alignment can continue to improve even as models surpass human ability on specific tasks.</p>
+      <p>These directions are gradually moving from pure research toward deployment. RLVR (Section 2) sidesteps the scalable oversight problem entirely for verifiable domains — if the math answer is checkable, you do not need human oversight at all. The open question is alignment on tasks where correctness is subjective: ethics, nuance, cultural sensitivity.</p>
     </section>
 
     <!-- ================================================================== -->
@@ -746,9 +848,11 @@ def dpo_loss(policy, ref_policy, chosen_ids, rejected_ids, beta=0.1):
 
       <h3>Alignment Tax</h3>
 
-      <p>The evidence is mixed. On one hand, InstructGPT (1.3B, aligned) was preferred by users over GPT-3 (175B, unaligned) — alignment made the smaller model more useful, not less capable. On the other hand, some benchmarks — particularly code generation (HumanEval), factual QA (TriviaQA), and mathematical reasoning — show slight degradation after RLHF. The model becomes more cautious, sometimes refusing valid requests or hedging when the pre-trained model would have answered directly.</p>
+      <p>The <strong>alignment tax</strong> quantifies the drop in core capabilities when safety alignment methods are applied. On one hand, InstructGPT (1.3B, aligned) was preferred by users over GPT-3 (175B, unaligned) — alignment made the smaller model more useful, not less capable. On the other hand, careful benchmarking reveals real costs: for OpenLLaMA-3B, increasing alignment reward from 0.16 to 0.35 caused SQuAD F1 to drop by 16 points, DROP F1 by 17 points, and WMT BLEU by 5.7 points (Lin et al., EMNLP 2024). The tax manifests as a monotonic trade-off — as safety alignment improves, specific capability metrics degrade.</p>
 
-      <p>The nuanced answer: alignment *redistributes* capability. The model becomes much better at tasks humans care about (following instructions, being helpful, refusing harmful requests) and slightly worse at tasks measured by raw benchmark performance (unfiltered text completion, unrestricted code generation). Whether this is a "tax" depends on what you are optimizing for.</p>
+      <p>Alignment *redistributes* capability. The model becomes much better at tasks humans care about (following instructions, being helpful, refusing harmful requests) and measurably worse at tasks captured by raw benchmark performance (unfiltered text completion, unrestricted code generation, factual QA). Whether this is a "tax" depends on what you are optimizing for.</p>
+
+      <p>Recent mitigation research is promising. NSPO (Niu et al., 2025) constructs a null space of general-task gradients and projects safety-policy gradient updates orthogonally to this subspace — mathematically guaranteeing zero first-order loss in benchmark metrics while still allowing alignment improvements. A different line of work shows that naively scaling safety training data often produces an "overly safe" model rather than a "truly safe" one — the model begins refusing legitimate requests ("I can't help with that" for benign queries) rather than genuinely understanding harm boundaries.</p>
 
       <h3>Safety vs. Helpfulness: The Pareto Frontier</h3>
 
@@ -798,7 +902,7 @@ def dpo_loss(policy, ref_policy, chosen_ids, rejected_ids, beta=0.1):
           <text x="412" y="205" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#9C9A94">Sub-optimal</text>
           <text x="412" y="217" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#9C9A94">(room to improve both)</text>
         </svg>
-        <figcaption>Figure 11.7 — The safety-helpfulness Pareto frontier. The purple curve is the boundary of achievable configurations — you cannot improve safety without reducing helpfulness (and vice versa) along this curve. The base model (coral) is maximally helpful but unsafe. Over-aligned models (amber) are safe but refuse too many legitimate requests. Production models (purple dots) sit at different points on the frontier, reflecting different values choices. Sub-optimal models (gray) can be improved on both dimensions.</figcaption>
+        <figcaption>Figure 11.8 — The safety-helpfulness Pareto frontier. The purple curve is the boundary of achievable configurations — you cannot improve safety without reducing helpfulness (and vice versa) along this curve. The base model (coral) is maximally helpful but unsafe. Over-aligned models (amber) are safe but refuse too many legitimate requests. Production models (purple dots) sit at different points on the frontier, reflecting different values choices. Sub-optimal models (gray) can be improved on both dimensions.</figcaption>
       </figure>
 
       <p>Different labs target different points on this frontier, and the choice is fundamentally about values, not technology. A model deployed for medical advice should prioritize safety over helpfulness. A model for creative writing should prioritize helpfulness. The alignment pipeline does not dictate where on the frontier to sit — it provides the tools to reach any point on it.</p>

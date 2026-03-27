@@ -1009,6 +1009,404 @@ pe = sinusoidal_positional_encoding(max_len=512, d_model=512)
       </div>
     </section>
 
+    <!-- ================================================================== -->
+    <!-- SECTION: PUTTING IT ALL TOGETHER — FULL IMPLEMENTATION             -->
+    <!-- ================================================================== -->
+    <section class="chapter-section" id="full-implementation">
+      <h2>Putting It All Together — Full Implementation</h2>
+
+      <p>We have walked through every component of the original Transformer: scaled dot-product attention, multi-head projections, position-wise feed-forward networks, positional encodings, residual connections, layer normalization, and the encoder-decoder structure. Now we assemble them into a single, runnable implementation and train it on a real dataset. The code below is one self-contained script &mdash; you can copy it into a file and run it directly.</p>
+
+      <p>We train a small Transformer on English-to-French translation using the <code>opus_books</code> dataset from HuggingFace. The model is deliberately tiny (2 layers, 256-dim, 4 heads) so it trains in minutes on a single GPU or even a CPU. The goal is not state-of-the-art BLEU &mdash; it is to see every matrix, every mask, every gradient flow through the architecture we just studied.</p>
+
+      <p>The full implementation follows.</p>
+
+<pre><code class="language-python">
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from datasets import load_dataset
+
+# ─── Hyperparameters ──────────────────────────────────────────────
+D_MODEL   = 256
+N_HEADS   = 4
+N_LAYERS  = 2
+D_FF      = 512
+DROPOUT   = 0.1
+MAX_LEN   = 64
+VOCAB_SIZE = 8000   # shared BPE-style vocabulary (we use word-level for simplicity)
+BATCH_SIZE = 32
+EPOCHS     = 5
+LR         = 3e-4
+DEVICE     = "cuda" if torch.cuda.is_available() else "cpu"
+
+# ─── Tokenizer (minimal word-level) ──────────────────────────────
+# A production system would use SentencePiece or BPE.
+# Here we build a simple word-level vocab for clarity.
+
+PAD_IDX = 0
+BOS_IDX = 1
+EOS_IDX = 2
+UNK_IDX = 3
+
+class WordTokenizer:
+    """Minimal word-level tokenizer with a fixed vocabulary size."""
+    def __init__(self, vocab_size=VOCAB_SIZE):
+        self.vocab_size = vocab_size
+        self.word2idx = {"&lt;pad&gt;": PAD_IDX, "&lt;bos&gt;": BOS_IDX,
+                         "&lt;eos&gt;": EOS_IDX, "&lt;unk&gt;": UNK_IDX}
+        self.idx2word = {v: k for k, v in self.word2idx.items()}
+
+    def build_vocab(self, sentences):
+        """Count word frequencies and keep the top vocab_size - 4 words."""
+        freq = {}
+        for s in sentences:
+            for w in s.lower().split():
+                freq[w] = freq.get(w, 0) + 1
+        top = sorted(freq, key=freq.get, reverse=True)[:self.vocab_size - 4]
+        for i, w in enumerate(top, start=4):
+            self.word2idx[w] = i
+            self.idx2word[i] = w
+
+    def encode(self, sentence, max_len=MAX_LEN):
+        """Tokenize and convert to padded index tensor."""
+        tokens = [BOS_IDX]
+        for w in sentence.lower().split()[:max_len - 2]:
+            tokens.append(self.word2idx.get(w, UNK_IDX))
+        tokens.append(EOS_IDX)
+        # Pad to max_len
+        tokens += [PAD_IDX] * (max_len - len(tokens))
+        return tokens
+
+    def decode(self, indices):
+        """Convert indices back to words, stopping at EOS."""
+        words = []
+        for idx in indices:
+            if idx == EOS_IDX:
+                break
+            if idx not in (PAD_IDX, BOS_IDX):
+                words.append(self.idx2word.get(idx, "&lt;unk&gt;"))
+        return " ".join(words)
+
+
+# ─── Dataset ─────────────────────────────────────────────────────
+class TranslationDataset(Dataset):
+    def __init__(self, src_encoded, tgt_encoded):
+        self.src = src_encoded
+        self.tgt = tgt_encoded
+
+    def __len__(self):
+        return len(self.src)
+
+    def __getitem__(self, idx):
+        return (torch.tensor(self.src[idx], dtype=torch.long),
+                torch.tensor(self.tgt[idx], dtype=torch.long))
+
+
+# ─── Positional Encoding ─────────────────────────────────────────
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=5000, dropout=DROPOUT):
+        super().__init__()
+        self.dropout = nn.Dropout(dropout)
+        pe = torch.zeros(max_len, d_model)             # (max_len, d_model)
+        pos = torch.arange(max_len).unsqueeze(1).float()  # (max_len, 1)
+        div = torch.exp(
+            torch.arange(0, d_model, 2).float()
+            * -(math.log(10000.0) / d_model)
+        )                                               # (d_model/2,)
+        pe[:, 0::2] = torch.sin(pos * div)             # even dims
+        pe[:, 1::2] = torch.cos(pos * div)             # odd dims
+        self.register_buffer("pe", pe.unsqueeze(0))     # (1, max_len, d_model)
+
+    def forward(self, x):
+        # x: (batch, seq_len, d_model)
+        x = x + self.pe[:, :x.size(1)]
+        return self.dropout(x)
+
+
+# ─── Scaled Dot-Product Attention ─────────────────────────────────
+def scaled_dot_product_attention(Q, K, V, mask=None):
+    """
+    Q: (batch, heads, seq_q, d_k)
+    K: (batch, heads, seq_k, d_k)
+    V: (batch, heads, seq_k, d_v)
+    mask: broadcastable to (batch, 1, seq_q, seq_k)
+
+    Returns: (batch, heads, seq_q, d_v), attention weights
+    """
+    d_k = Q.size(-1)
+    # QK^T (matrix multiply, R^{seq_q x d_k} @ R^{d_k x seq_k} -> R^{seq_q x seq_k})
+    scores = Q @ K.transpose(-2, -1) / math.sqrt(d_k)  # (batch, heads, seq_q, seq_k)
+    if mask is not None:
+        scores = scores.masked_fill(mask == 0, float("-inf"))
+    weights = F.softmax(scores, dim=-1)                 # (batch, heads, seq_q, seq_k)
+    return weights @ V, weights                         # (batch, heads, seq_q, d_v)
+
+
+# ─── Multi-Head Attention ─────────────────────────────────────────
+class MultiHeadAttention(nn.Module):
+    def __init__(self, d_model, n_heads, dropout=DROPOUT):
+        super().__init__()
+        assert d_model % n_heads == 0
+        self.d_k = d_model // n_heads
+        self.n_heads = n_heads
+        self.W_Q = nn.Linear(d_model, d_model)
+        self.W_K = nn.Linear(d_model, d_model)
+        self.W_V = nn.Linear(d_model, d_model)
+        self.W_O = nn.Linear(d_model, d_model)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, query, key, value, mask=None):
+        B = query.size(0)
+        # Project and reshape: (batch, seq, d_model) -> (batch, heads, seq, d_k)
+        Q = self.W_Q(query).view(B, -1, self.n_heads, self.d_k).transpose(1, 2)
+        K = self.W_K(key).view(B, -1, self.n_heads, self.d_k).transpose(1, 2)
+        V = self.W_V(value).view(B, -1, self.n_heads, self.d_k).transpose(1, 2)
+
+        attn_out, _ = scaled_dot_product_attention(Q, K, V, mask)
+        # Concatenate heads: (batch, heads, seq, d_k) -> (batch, seq, d_model)
+        concat = attn_out.transpose(1, 2).contiguous().view(B, -1, self.n_heads * self.d_k)
+        return self.W_O(concat)                         # (batch, seq, d_model)
+
+
+# ─── Position-wise Feed-Forward Network ──────────────────────────
+class FeedForward(nn.Module):
+    def __init__(self, d_model, d_ff, dropout=DROPOUT):
+        super().__init__()
+        self.linear1 = nn.Linear(d_model, d_ff)
+        self.linear2 = nn.Linear(d_ff, d_model)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        # x: (batch, seq, d_model)
+        return self.linear2(self.dropout(F.relu(self.linear1(x))))
+
+
+# ─── Encoder Layer ────────────────────────────────────────────────
+class EncoderLayer(nn.Module):
+    def __init__(self, d_model, n_heads, d_ff, dropout=DROPOUT):
+        super().__init__()
+        self.self_attn = MultiHeadAttention(d_model, n_heads, dropout)
+        self.ffn = FeedForward(d_model, d_ff, dropout)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+
+    def forward(self, x, src_mask):
+        # Self-attention sublayer with residual + norm
+        attn_out = self.self_attn(x, x, x, src_mask)
+        x = self.norm1(x + self.dropout1(attn_out))    # (batch, src_len, d_model)
+        # FFN sublayer with residual + norm
+        ffn_out = self.ffn(x)
+        x = self.norm2(x + self.dropout2(ffn_out))     # (batch, src_len, d_model)
+        return x
+
+
+# ─── Decoder Layer ────────────────────────────────────────────────
+class DecoderLayer(nn.Module):
+    def __init__(self, d_model, n_heads, d_ff, dropout=DROPOUT):
+        super().__init__()
+        self.self_attn   = MultiHeadAttention(d_model, n_heads, dropout)
+        self.cross_attn  = MultiHeadAttention(d_model, n_heads, dropout)
+        self.ffn         = FeedForward(d_model, d_ff, dropout)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.norm3 = nn.LayerNorm(d_model)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        self.dropout3 = nn.Dropout(dropout)
+
+    def forward(self, x, enc_out, src_mask, tgt_mask):
+        # Masked self-attention (causal)
+        attn_out = self.self_attn(x, x, x, tgt_mask)
+        x = self.norm1(x + self.dropout1(attn_out))    # (batch, tgt_len, d_model)
+        # Cross-attention over encoder output
+        cross_out = self.cross_attn(x, enc_out, enc_out, src_mask)
+        x = self.norm2(x + self.dropout2(cross_out))   # (batch, tgt_len, d_model)
+        # FFN
+        ffn_out = self.ffn(x)
+        x = self.norm3(x + self.dropout3(ffn_out))     # (batch, tgt_len, d_model)
+        return x
+
+
+# ─── Full Transformer ────────────────────────────────────────────
+class Transformer(nn.Module):
+    def __init__(self, src_vocab, tgt_vocab, d_model, n_heads,
+                 n_layers, d_ff, max_len, dropout=DROPOUT):
+        super().__init__()
+        self.src_embed = nn.Embedding(src_vocab, d_model, padding_idx=PAD_IDX)
+        self.tgt_embed = nn.Embedding(tgt_vocab, d_model, padding_idx=PAD_IDX)
+        self.pos_enc   = PositionalEncoding(d_model, max_len, dropout)
+        self.scale     = math.sqrt(d_model)
+
+        self.encoder_layers = nn.ModuleList(
+            [EncoderLayer(d_model, n_heads, d_ff, dropout) for _ in range(n_layers)]
+        )
+        self.decoder_layers = nn.ModuleList(
+            [DecoderLayer(d_model, n_heads, d_ff, dropout) for _ in range(n_layers)]
+        )
+        self.output_proj = nn.Linear(d_model, tgt_vocab)
+
+    def make_src_mask(self, src):
+        # src: (batch, src_len) -> mask: (batch, 1, 1, src_len)
+        return (src != PAD_IDX).unsqueeze(1).unsqueeze(2)
+
+    def make_tgt_mask(self, tgt):
+        B, T = tgt.shape
+        # Padding mask: (batch, 1, 1, tgt_len)
+        pad_mask = (tgt != PAD_IDX).unsqueeze(1).unsqueeze(2)
+        # Causal mask: (1, 1, tgt_len, tgt_len) — lower triangular
+        causal = torch.tril(torch.ones(T, T, device=tgt.device)).bool()
+        causal = causal.unsqueeze(0).unsqueeze(1)
+        return pad_mask &amp; causal   # (batch, 1, tgt_len, tgt_len)
+
+    def encode(self, src, src_mask):
+        x = self.pos_enc(self.src_embed(src) * self.scale)  # (batch, src_len, d_model)
+        for layer in self.encoder_layers:
+            x = layer(x, src_mask)
+        return x
+
+    def decode(self, tgt, enc_out, src_mask, tgt_mask):
+        x = self.pos_enc(self.tgt_embed(tgt) * self.scale)  # (batch, tgt_len, d_model)
+        for layer in self.decoder_layers:
+            x = layer(x, enc_out, src_mask, tgt_mask)
+        return x
+
+    def forward(self, src, tgt):
+        src_mask = self.make_src_mask(src)                # (batch, 1, 1, src_len)
+        tgt_mask = self.make_tgt_mask(tgt)                # (batch, 1, tgt_len, tgt_len)
+        enc_out  = self.encode(src, src_mask)              # (batch, src_len, d_model)
+        dec_out  = self.decode(tgt, enc_out, src_mask, tgt_mask)
+        logits   = self.output_proj(dec_out)               # (batch, tgt_len, tgt_vocab)
+        return logits
+
+
+# ─── Data Loading (HuggingFace) ──────────────────────────────────
+print("Loading opus_books en-fr dataset...")
+raw = load_dataset("opus_books", "en-fr", split="train[:20000]")
+
+en_sentences = [ex["translation"]["en"] for ex in raw]
+fr_sentences = [ex["translation"]["fr"] for ex in raw]
+
+# Build tokenizers
+src_tok = WordTokenizer(VOCAB_SIZE)
+tgt_tok = WordTokenizer(VOCAB_SIZE)
+src_tok.build_vocab(en_sentences)
+tgt_tok.build_vocab(fr_sentences)
+
+# Encode all sentences
+src_encoded = [src_tok.encode(s) for s in en_sentences]
+tgt_encoded = [tgt_tok.encode(s) for s in fr_sentences]
+
+# Split: 90% train, 10% val
+split = int(0.9 * len(src_encoded))
+train_ds = TranslationDataset(src_encoded[:split], tgt_encoded[:split])
+val_ds   = TranslationDataset(src_encoded[split:], tgt_encoded[split:])
+train_dl = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
+val_dl   = DataLoader(val_ds,   batch_size=BATCH_SIZE)
+
+# ─── Model, Optimizer, Loss ──────────────────────────────────────
+model = Transformer(
+    src_vocab=VOCAB_SIZE, tgt_vocab=VOCAB_SIZE,
+    d_model=D_MODEL, n_heads=N_HEADS, n_layers=N_LAYERS,
+    d_ff=D_FF, max_len=MAX_LEN, dropout=DROPOUT
+).to(DEVICE)
+
+optimizer = torch.optim.Adam(model.parameters(), lr=LR, betas=(0.9, 0.98), eps=1e-9)
+criterion = nn.CrossEntropyLoss(ignore_index=PAD_IDX, label_smoothing=0.1)
+
+n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+print(f"Model parameters: {n_params:,}")
+print(f"Device: {DEVICE}")
+
+# ─── Training Loop ───────────────────────────────────────────────
+for epoch in range(1, EPOCHS + 1):
+    model.train()
+    total_loss = 0
+
+    for src, tgt in train_dl:
+        src, tgt = src.to(DEVICE), tgt.to(DEVICE)
+
+        # Teacher forcing: input is tgt[:-1], target is tgt[1:]
+        tgt_input  = tgt[:, :-1]                        # (batch, tgt_len - 1)
+        tgt_target = tgt[:, 1:]                         # (batch, tgt_len - 1)
+
+        logits = model(src, tgt_input)                  # (batch, tgt_len-1, vocab)
+        loss = criterion(
+            logits.reshape(-1, logits.size(-1)),        # (batch*(tgt_len-1), vocab)
+            tgt_target.reshape(-1)                      # (batch*(tgt_len-1),)
+        )
+
+        optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        optimizer.step()
+        total_loss += loss.item()
+
+    avg_loss = total_loss / len(train_dl)
+
+    # ─── Validation ───────────────────────────────────────────
+    model.eval()
+    val_loss = 0
+    with torch.no_grad():
+        for src, tgt in val_dl:
+            src, tgt = src.to(DEVICE), tgt.to(DEVICE)
+            tgt_input  = tgt[:, :-1]
+            tgt_target = tgt[:, 1:]
+            logits = model(src, tgt_input)
+            loss = criterion(
+                logits.reshape(-1, logits.size(-1)),
+                tgt_target.reshape(-1)
+            )
+            val_loss += loss.item()
+    avg_val = val_loss / len(val_dl)
+
+    print(f"Epoch {epoch}/{EPOCHS}  train_loss={avg_loss:.4f}  val_loss={avg_val:.4f}")
+
+
+# ─── Greedy Decode (inference) ────────────────────────────────────
+@torch.no_grad()
+def greedy_translate(model, src_sentence, src_tok, tgt_tok, max_len=MAX_LEN):
+    model.eval()
+    src_ids = torch.tensor([src_tok.encode(src_sentence)], device=DEVICE)
+    src_mask = model.make_src_mask(src_ids)
+    enc_out = model.encode(src_ids, src_mask)
+
+    # Start with BOS token
+    tgt_ids = torch.tensor([[BOS_IDX]], device=DEVICE)
+    for _ in range(max_len - 1):
+        tgt_mask = model.make_tgt_mask(tgt_ids)
+        dec_out = model.decode(tgt_ids, enc_out, src_mask, tgt_mask)
+        logits = model.output_proj(dec_out[:, -1, :])   # (1, vocab)
+        next_id = logits.argmax(dim=-1, keepdim=True)
+        tgt_ids = torch.cat([tgt_ids, next_id], dim=1)
+        if next_id.item() == EOS_IDX:
+            break
+    return tgt_tok.decode(tgt_ids.squeeze().tolist())
+
+
+# ─── Try a few translations ──────────────────────────────────────
+test_sentences = [
+    "I love you.",
+    "The cat sat on the mat.",
+    "This book is very interesting.",
+]
+print("\n--- Sample Translations ---")
+for s in test_sentences:
+    translation = greedy_translate(model, s, src_tok, tgt_tok)
+    print(f"  EN: {s}")
+    print(f"  FR: {translation}\n")
+</code></pre>
+
+      <p>A few things to notice. The <code>make_tgt_mask</code> method combines a padding mask with a causal (lower-triangular) mask using a bitwise AND &mdash; this is exactly the masking strategy described in the paper. Teacher forcing feeds the ground-truth target shifted by one position: the model sees <code>&lt;bos&gt; w1 w2 ...</code> and predicts <code>w1 w2 ... &lt;eos&gt;</code>. The <code>label_smoothing=0.1</code> in the loss function matches the original paper's regularization. Gradient clipping at 1.0 keeps training stable even with this small model.</p>
+
+      <p>With 20,000 sentence pairs and 5 epochs of training, do not expect fluent French. The translations will be rough but recognizable &mdash; the point is that every tensor shape, every mask, every residual connection flows exactly as described in the preceding sections. Swap in a larger vocabulary (SentencePiece), more data, more layers, and a learning rate schedule, and this same architecture scales to production quality.</p>
+
+    </section>
+
   </article>
 
   <footer class="chapter-footer">
