@@ -1,0 +1,1257 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Chapter 18: Hierarchical Vision Transformers — Transformer Research Book</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <link rel="stylesheet" href="../assets/math.css">
+  <link rel="stylesheet" href="../assets/prism.css">
+  <!-- KaTeX for math rendering -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left: '$$', right: '$$', display: true},
+        {left: '$', right: '$', display: false}
+      ]
+    })">
+  </script>
+  <!-- Prism for code blocks -->
+  <script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/prism.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-python.min.js"></script>
+</head>
+<body>
+  <nav class="chapter-nav">
+    <a href="../index.html" class="nav-home">← Table of Contents</a>
+    <span class="nav-chapter">Chapter 18</span>
+    <div style="display:flex; align-items:center; gap:1rem;">
+      <button class="theme-toggle" onclick="toggleTheme()" aria-label="Toggle dark mode">
+        <span class="icon-moon">&#9789;</span><span class="icon-sun">&#9788;</span>
+      </button>
+      <a href="ch19.html" class="nav-next">Next Chapter →</a>
+    </div>
+  </nav>
+  <script>
+    function toggleTheme() {
+      document.documentElement.classList.toggle('dark');
+      localStorage.setItem('theme', document.documentElement.classList.contains('dark') ? 'dark' : 'light');
+    }
+    if (localStorage.getItem('theme') === 'dark') document.documentElement.classList.add('dark');
+  </script>
+
+  <article class="chapter">
+
+    <header class="chapter-header">
+      <div class="chapter-number">Chapter 18</div>
+      <h1 class="chapter-title">Hierarchical Vision Transformers</h1>
+      <p class="chapter-lead">A Vision Transformer trained on 224×224 images outputs 196 tokens arranged on a 14×14 grid — every token representing a 16×16 patch at the same resolution. For classification this is fine: pool everything into one vector and predict a label. But the moment you ask the model to find a pedestrian thirty pixels tall standing next to a building that fills the frame, you need features at radically different spatial scales simultaneously. CNNs solved this a decade ago by tapping intermediate layers at progressively coarser resolutions. How do you build the same multi-scale structure into a transformer that has no inherent spatial hierarchy? This chapter traces the answer from Swin Transformer's shifted windows through the simplification revolt of Hiera, the rise of attention-free and SSM-based alternatives, and the provocative possibility that pretraining alone can make architectural hierarchy unnecessary.</p>
+    </header>
+
+    <!-- ================================================================== -->
+    <!-- SECTION 1: THE LIMITATION OF ViT FOR DENSE PREDICTION              -->
+    <!-- ================================================================== -->
+    <section class="chapter-section" id="limitation-dense-prediction">
+      <h2>The Limitation of ViT for Dense Prediction</h2>
+
+      <h3>Single-scale features and why they fail</h3>
+
+      <p>A standard ViT with 16×16 patches and a 224×224 input produces a single feature map at $\frac{1}{16}$ resolution — a 14×14 grid. Every patch, whether it covers a tiny object corner or empty sky, gets the same fixed spatial extent. Object detection requires localizing targets spanning anything from 10 pixels to the full image. Semantic segmentation requires per-pixel labels. Both tasks demand features at multiple spatial resolutions: high-resolution maps to capture fine boundaries, low-resolution maps to capture global context. The Feature Pyramid Network (FPN) gives CNNs this for free by tapping activations after each pooling stage, producing feature maps at $\frac{1}{4}$, $\frac{1}{8}$, $\frac{1}{16}$, and $\frac{1}{32}$ of the input resolution. ViT has no such intermediate stages — it produces one resolution and that is all.</p>
+
+      <h3>The computational wall</h3>
+
+      <p>The obvious fix — use smaller patches to get higher-resolution tokens — runs into the quadratic cost of self-attention. With 16×16 patches on a 224×224 image we have $n = 196$ tokens and attention costs $O(n^2 d)$ (matrix multiply, $\mathbb{R}^{n \times d} \times \mathbb{R}^{d \times n} \to \mathbb{R}^{n \times n}$). Shrink patches to 4×4 and $n$ jumps to 3,136; use a 1024×1024 input at 16×16 patches and $n = 4{,}096$. The attention cost scales with $n^2$: going from 196 to 4,096 tokens increases it by over 400×. Dense prediction at high resolution with global self-attention is computationally infeasible.</p>
+
+      <h3>The design space for hierarchical transformers</h3>
+
+      <p>Four strategies emerged to inject multi-scale structure into vision transformers. First, restrict attention to local windows and use a shifting mechanism for cross-window communication (Swin). Second, keep global attention but spatially downsample keys and values to reduce cost (PVT). Third, build a multi-stage pipeline that progressively merges tokens, creating naturally hierarchical feature maps. Fourth, abandon attention altogether and use alternative token-mixing operations in a hierarchical shell (FocalNet, Vision KAN). The rest of this chapter explores each approach, the designs they inspired, and the surprising discovery that pretraining may render much of this architectural engineering unnecessary.</p>
+
+      <figure class="diagram-figure">
+        <svg width="100%" viewBox="0 0 800 370" xmlns="http://www.w3.org/2000/svg">
+          <defs>
+            <marker id="ch18-arr" viewBox="0 0 10 10" refX="9" refY="5"
+              markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+              <path d="M1 1L9 5L1 9" fill="none" stroke="context-stroke"
+                stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+            </marker>
+          </defs>
+
+          <!-- Panel headers -->
+          <rect x="20" y="16" width="350" height="30" rx="5" fill="#FAECE7" stroke="#F0997B" stroke-width="1"/>
+          <text x="195" y="36" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="13" font-weight="600" fill="#993C1D">Plain ViT — Single Scale</text>
+
+          <rect x="430" y="16" width="350" height="30" rx="5" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1"/>
+          <text x="605" y="36" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="13" font-weight="600" fill="#0F6E56">Hierarchical — Multi-Scale</text>
+
+          <!-- Vertical divider -->
+          <line x1="400" y1="10" x2="400" y2="360" stroke="#E5E3DC" stroke-width="1" stroke-dasharray="5 4"/>
+
+          <!-- Left panel: ViT single-scale -->
+          <!-- Input image -->
+          <rect x="50" y="70" width="80" height="80" rx="4" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1.5"/>
+          <text x="90" y="115" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#0F6E56">224×224</text>
+
+          <line x1="130" y1="110" x2="160" y2="110" stroke="#9C9A94" stroke-width="1.5" marker-end="url(#ch18-arr)"/>
+
+          <!-- Transformer encoder -->
+          <rect x="160" y="85" width="90" height="50" rx="6" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1.5"/>
+          <text x="205" y="107" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#534AB7">ViT Encoder</text>
+          <text x="205" y="122" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#9C9A94">×12 layers</text>
+
+          <line x1="250" y1="110" x2="280" y2="110" stroke="#9C9A94" stroke-width="1.5" marker-end="url(#ch18-arr)"/>
+
+          <!-- Single output feature map -->
+          <rect x="280" y="90" width="60" height="40" rx="4" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1.5"/>
+          <text x="310" y="114" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#534AB7">14×14</text>
+
+          <!-- Small object highlighted -->
+          <rect x="56" y="76" width="12" height="12" rx="2" fill="#FAECE7" stroke="#F0997B" stroke-width="1.5"/>
+          <text x="62" y="65" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#993C1D">small obj</text>
+
+          <!-- Large object -->
+          <rect x="66" y="96" width="50" height="40" rx="2" fill="none" stroke="#854F0B" stroke-width="1.5" stroke-dasharray="3 2"/>
+          <text x="91" y="155" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#854F0B">large obj</text>
+
+          <!-- Problem annotation -->
+          <text x="195" y="170" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#993C1D">Both objects mapped to</text>
+          <text x="195" y="185" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#993C1D">the same 14×14 grid</text>
+
+          <!-- Right panel: Hierarchical multi-scale -->
+          <!-- Input image -->
+          <rect x="445" y="70" width="80" height="80" rx="4" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1.5"/>
+          <text x="485" y="115" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#0F6E56">224×224</text>
+
+          <line x1="525" y1="110" x2="555" y2="75" stroke="#9C9A94" stroke-width="1.5" marker-end="url(#ch18-arr)"/>
+          <line x1="525" y1="110" x2="555" y2="100" stroke="#9C9A94" stroke-width="1.5" marker-end="url(#ch18-arr)"/>
+          <line x1="525" y1="110" x2="555" y2="125" stroke="#9C9A94" stroke-width="1.5" marker-end="url(#ch18-arr)"/>
+          <line x1="525" y1="110" x2="555" y2="150" stroke="#9C9A94" stroke-width="1.5" marker-end="url(#ch18-arr)"/>
+
+          <!-- Four-scale feature maps -->
+          <rect x="555" y="56" width="72" height="30" rx="4" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1.5"/>
+          <text x="591" y="75" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#534AB7">56×56 (¼)</text>
+
+          <rect x="555" y="90" width="58" height="24" rx="4" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1.5"/>
+          <text x="584" y="106" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#534AB7">28×28 (⅛)</text>
+
+          <rect x="555" y="118" width="44" height="20" rx="4" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1.5"/>
+          <text x="577" y="132" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#534AB7">14×14</text>
+
+          <rect x="555" y="142" width="32" height="18" rx="4" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1.5"/>
+          <text x="571" y="155" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#534AB7">7×7</text>
+
+          <!-- FPN lateral connections -->
+          <rect x="645" y="56" width="110" height="105" rx="6" fill="none" stroke="#B4B2A9" stroke-width="1" stroke-dasharray="5 4"/>
+          <text x="700" y="115" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#5C5B56">FPN / Neck</text>
+
+          <line x1="627" y1="71" x2="645" y2="80" stroke="#9C9A94" stroke-width="1" marker-end="url(#ch18-arr)"/>
+          <line x1="613" y1="102" x2="645" y2="95" stroke="#9C9A94" stroke-width="1" marker-end="url(#ch18-arr)"/>
+          <line x1="599" y1="128" x2="645" y2="110" stroke="#9C9A94" stroke-width="1" marker-end="url(#ch18-arr)"/>
+          <line x1="587" y1="151" x2="645" y2="130" stroke="#9C9A94" stroke-width="1" marker-end="url(#ch18-arr)"/>
+
+          <!-- Benefit annotations -->
+          <text x="605" y="190" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#0F6E56">Small objects → high-res map</text>
+          <text x="605" y="205" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#0F6E56">Large objects → low-res map</text>
+
+          <!-- Bottom: complexity comparison -->
+          <rect x="30" y="225" width="340" height="55" rx="6" fill="#FAECE7" stroke="#F0997B" stroke-width="1"/>
+          <text x="200" y="248" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="500" fill="#993C1D">Global attention: O(n² d)</text>
+          <text x="200" y="268" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#993C1D">n = 4096 tokens at 1024×1024 → 16.7M ops/layer</text>
+
+          <rect x="430" y="225" width="340" height="55" rx="6" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1"/>
+          <text x="600" y="248" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="500" fill="#0F6E56">Window attention: O(M² · n · d)</text>
+          <text x="600" y="268" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#0F6E56">M = 7, n = 4096 → 200K ops/layer (84× cheaper)</text>
+
+          <!-- Stage labels -->
+          <text x="200" y="310" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="400" fill="#9C9A94">n grows → cost explodes</text>
+          <text x="600" y="310" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="400" fill="#9C9A94">cost grows linearly with n</text>
+        </svg>
+        <figcaption>Figure 18.1 — Left: a plain ViT produces a single 14×14 feature map — both small and large objects are represented at the same resolution. Right: a hierarchical backbone produces feature maps at four resolutions (¼ through 1/32), enabling an FPN to match features to object scales. The cost comparison at bottom shows why window attention is essential for high-resolution inputs.</figcaption>
+      </figure>
+    </section>
+
+    <!-- ================================================================== -->
+    <!-- SECTION 2: SWIN TRANSFORMER                                        -->
+    <!-- ================================================================== -->
+    <section class="chapter-section" id="swin-transformer">
+      <h2>Swin Transformer</h2>
+
+      <p>The Swin Transformer (Liu et al., 2021) was the first hierarchical vision transformer to convincingly beat both CNNs and plain ViTs on dense prediction tasks. Its two core ideas — window-based local attention and a shifted-window scheme for cross-window communication — became the template that nearly every subsequent hierarchical ViT either built on or reacted against.</p>
+
+      <h3>Shifted window attention</h3>
+
+      <p>Instead of computing attention over all $n$ tokens (global attention), Swin partitions the feature map into non-overlapping $M \times M$ windows and computes attention independently within each window. For a feature map with $h \times w$ tokens and window size $M = 7$, each window contains $M^2 = 49$ tokens. Attention within a window costs $O(M^2 \cdot M^2 \cdot d) = O(M^4 d)$ per window, and there are $\frac{hw}{M^2}$ windows, so total cost is $O(hw \cdot M^2 \cdot d)$ — linear in the number of tokens rather than quadratic.</p>
+
+      <p>The problem: tokens in one window cannot see tokens in adjacent windows. Swin fixes this by alternating between two window configurations. In odd-numbered layers, the standard partition is used. In even-numbered layers, the window grid is shifted by $(\lfloor M/2 \rfloor, \lfloor M/2 \rfloor)$ pixels, so the new windows straddle the boundaries of the previous partition. Tokens that were separated by a window boundary in layer $\ell$ share a window in layer $\ell + 1$.</p>
+
+      <figure class="diagram-figure">
+        <svg width="100%" viewBox="0 0 800 310" xmlns="http://www.w3.org/2000/svg">
+          <defs>
+            <marker id="ch18-arr2" viewBox="0 0 10 10" refX="9" refY="5"
+              markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+              <path d="M1 1L9 5L1 9" fill="none" stroke="context-stroke"
+                stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+            </marker>
+          </defs>
+
+          <!-- Left panel: Regular windows -->
+          <text x="195" y="28" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="13" font-weight="600" fill="#534AB7">Layer ℓ — Regular Windows</text>
+
+          <!-- 8×8 grid with 4×4 windows -->
+          <!-- Window 1 (top-left) - purple light -->
+          <rect x="55" y="45" width="120" height="120" rx="4" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1.5"/>
+          <!-- Window 2 (top-right) - purple mid -->
+          <rect x="175" y="45" width="120" height="120" rx="4" fill="#E6F1FB" stroke="#85B7EB" stroke-width="1.5"/>
+          <!-- Window 3 (bottom-left) - teal light -->
+          <rect x="55" y="165" width="120" height="120" rx="4" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1.5"/>
+          <!-- Window 4 (bottom-right) - amber light -->
+          <rect x="175" y="165" width="120" height="120" rx="4" fill="#FAEEDA" stroke="#EF9F27" stroke-width="1.5"/>
+
+          <!-- Grid lines within windows -->
+          <g stroke="#C8C6BE" stroke-width="0.5">
+            <!-- Vertical lines -->
+            <line x1="85" y1="45" x2="85" y2="285"/>
+            <line x1="115" y1="45" x2="115" y2="285"/>
+            <line x1="145" y1="45" x2="145" y2="285"/>
+            <line x1="205" y1="45" x2="205" y2="285"/>
+            <line x1="235" y1="45" x2="235" y2="285"/>
+            <line x1="265" y1="45" x2="265" y2="285"/>
+            <!-- Horizontal lines -->
+            <line x1="55" y1="75" x2="295" y2="75"/>
+            <line x1="55" y1="105" x2="295" y2="105"/>
+            <line x1="55" y1="135" x2="295" y2="135"/>
+            <line x1="55" y1="195" x2="295" y2="195"/>
+            <line x1="55" y1="225" x2="295" y2="225"/>
+            <line x1="55" y1="255" x2="295" y2="255"/>
+          </g>
+
+          <!-- Bold window borders -->
+          <line x1="175" y1="45" x2="175" y2="285" stroke="#534AB7" stroke-width="2"/>
+          <line x1="55" y1="165" x2="295" y2="165" stroke="#534AB7" stroke-width="2"/>
+
+          <!-- Boundary tokens highlighted -->
+          <rect x="145" y="135" width="30" height="30" rx="2" fill="#FAECE7" stroke="#F0997B" stroke-width="1.5"/>
+          <rect x="175" y="135" width="30" height="30" rx="2" fill="#FAECE7" stroke="#F0997B" stroke-width="1.5"/>
+          <text x="175" y="180" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#993C1D">can't attend</text>
+
+          <!-- Arrow to right panel -->
+          <line x1="310" y1="165" x2="380" y2="165" stroke="#534AB7" stroke-width="2" marker-end="url(#ch18-arr2)"/>
+          <text x="345" y="155" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#534AB7">shift</text>
+          <text x="345" y="185" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#9C9A94">by (M/2, M/2)</text>
+
+          <!-- Right panel: Shifted windows -->
+          <text x="595" y="28" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="13" font-weight="600" fill="#534AB7">Layer ℓ+1 — Shifted Windows</text>
+
+          <!-- Background grid -->
+          <rect x="435" y="45" width="240" height="240" rx="0" fill="#F1EFE8" stroke="#C8C6BE" stroke-width="1"/>
+
+          <!-- Shifted window regions (offset by 2 cells = 60px) -->
+          <!-- Center window (main, largest) -->
+          <rect x="495" y="105" width="120" height="120" rx="4" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1.5"/>
+          <!-- Top-left corner -->
+          <rect x="435" y="45" width="60" height="60" rx="4" fill="#FAEEDA" stroke="#EF9F27" stroke-width="1.5"/>
+          <!-- Top-right corner -->
+          <rect x="615" y="45" width="60" height="60" rx="4" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1.5"/>
+          <!-- Bottom-left corner -->
+          <rect x="435" y="225" width="60" height="60" rx="4" fill="#E6F1FB" stroke="#85B7EB" stroke-width="1.5"/>
+          <!-- Bottom-right corner -->
+          <rect x="615" y="225" width="60" height="60" rx="4" fill="#FAECE7" stroke="#F0997B" stroke-width="1.5"/>
+          <!-- Top-center -->
+          <rect x="495" y="45" width="120" height="60" rx="4" fill="none" stroke="#B4B2A9" stroke-width="1" stroke-dasharray="3 2"/>
+          <!-- Left-center -->
+          <rect x="435" y="105" width="60" height="120" rx="4" fill="none" stroke="#B4B2A9" stroke-width="1" stroke-dasharray="3 2"/>
+          <!-- Right-center -->
+          <rect x="615" y="105" width="60" height="120" rx="4" fill="none" stroke="#B4B2A9" stroke-width="1" stroke-dasharray="3 2"/>
+          <!-- Bottom-center -->
+          <rect x="495" y="225" width="120" height="60" rx="4" fill="none" stroke="#B4B2A9" stroke-width="1" stroke-dasharray="3 2"/>
+
+          <!-- Grid lines -->
+          <g stroke="#C8C6BE" stroke-width="0.5">
+            <line x1="465" y1="45" x2="465" y2="285"/>
+            <line x1="525" y1="45" x2="525" y2="285"/>
+            <line x1="555" y1="45" x2="555" y2="285"/>
+            <line x1="585" y1="45" x2="585" y2="285"/>
+            <line x1="645" y1="45" x2="645" y2="285"/>
+            <line x1="435" y1="75" x2="675" y2="75"/>
+            <line x1="435" y1="135" x2="675" y2="135"/>
+            <line x1="435" y1="165" x2="675" y2="165"/>
+            <line x1="435" y1="195" x2="675" y2="195"/>
+            <line x1="435" y1="255" x2="675" y2="255"/>
+          </g>
+
+          <!-- Previously separated tokens now share a window -->
+          <rect x="525" y="105" width="30" height="30" rx="2" fill="#0F6E56" stroke="#0F6E56" stroke-width="1"/>
+          <rect x="555" y="105" width="30" height="30" rx="2" fill="#0F6E56" stroke="#0F6E56" stroke-width="1"/>
+          <text x="555" y="98" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="500" fill="#0F6E56">now attend!</text>
+
+          <!-- Caption text at bottom -->
+          <text x="400" y="303" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#9C9A94">Tokens at the boundary (coral) are separated in layer ℓ but share a window in layer ℓ+1</text>
+        </svg>
+        <figcaption>Figure 18.2 — Shifted window attention. Left: an 8×8 feature map partitioned into four 4×4 non-overlapping windows. Tokens at the boundary (coral) cannot attend to each other. Right: after shifting the partition by (M/2, M/2), the previously separated boundary tokens share a window (green) and can now exchange information. Swin alternates between these two configurations in consecutive layers.</figcaption>
+      </figure>
+
+      <h3>Hierarchical stages and patch merging</h3>
+
+      <p>Swin organizes its layers into four stages, mirroring the four downsampling stages of a ResNet. Stage 1 operates at $\frac{H}{4} \times \frac{W}{4}$ spatial resolution with channel dimension $C$. Between stages, a **patch merging** layer halves the spatial resolution and doubles the channels. It concatenates features from 2×2 neighboring tokens — producing vectors of dimension $4C$ — then applies a linear projection to reduce this back to $2C$:</p>
+
+      $$\text{Merge}(x) = \text{Linear}_{4C \to 2C}\!\left(\text{Concat}(x_{0,0},\, x_{0,1},\, x_{1,0},\, x_{1,1})\right)$$
+
+      <p>where the subscripts index the four spatial positions in each 2×2 block. The result: Stage 1 outputs features at $\frac{H}{4} \times \frac{W}{4} \times C$, Stage 2 at $\frac{H}{8} \times \frac{W}{8} \times 2C$, Stage 3 at $\frac{H}{16} \times \frac{W}{16} \times 4C$, and Stage 4 at $\frac{H}{32} \times \frac{W}{32} \times 8C$. These four feature maps can be fed directly into an FPN for detection or a decoder for segmentation.</p>
+
+      <p>The following code implements the patch merging operation.</p>
+
+<pre><code class="language-python">
+import torch
+import torch.nn as nn
+
+class PatchMerging(nn.Module):
+    """Swin-style patch merging: 2x2 spatial merge + linear projection."""
+    def __init__(self, dim: int):
+        super().__init__()
+        self.proj = nn.Linear(4 * dim, 2 * dim, bias=False)
+        self.norm = nn.LayerNorm(4 * dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (batch, H, W, C)
+        B, H, W, C = x.shape
+        x0 = x[:, 0::2, 0::2, :]  # (B, H/2, W/2, C) — top-left
+        x1 = x[:, 1::2, 0::2, :]  # (B, H/2, W/2, C) — bottom-left
+        x2 = x[:, 0::2, 1::2, :]  # (B, H/2, W/2, C) — top-right
+        x3 = x[:, 1::2, 1::2, :]  # (B, H/2, W/2, C) — bottom-right
+        merged = torch.cat([x0, x1, x2, x3], dim=-1)  # (B, H/2, W/2, 4C)
+        merged = self.norm(merged)
+        out = self.proj(merged)  # (B, H/2, W/2, 2C)
+        return out
+</code></pre>
+
+      <figure class="diagram-figure">
+        <svg width="100%" viewBox="0 0 800 420" xmlns="http://www.w3.org/2000/svg">
+          <defs>
+            <marker id="ch18-arr3" viewBox="0 0 10 10" refX="9" refY="5"
+              markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+              <path d="M1 1L9 5L1 9" fill="none" stroke="context-stroke"
+                stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+            </marker>
+          </defs>
+
+          <text x="400" y="24" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="14" font-weight="600" fill="#1A1A18">Swin Transformer — 4-Stage Hierarchical Architecture</text>
+
+          <!-- Input -->
+          <rect x="140" y="45" width="520" height="40" rx="6" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1.5"/>
+          <text x="400" y="66" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="500" fill="#0F6E56">Input Image: H × W × 3</text>
+          <text x="400" y="80" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#9C9A94">Patch partition + Linear embedding</text>
+
+          <line x1="400" y1="85" x2="400" y2="100" stroke="#9C9A94" stroke-width="1.5" marker-end="url(#ch18-arr3)"/>
+
+          <!-- Stage 1 -->
+          <rect x="140" y="100" width="520" height="50" rx="6" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1.5"/>
+          <text x="280" y="125" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="500" fill="#534AB7">Stage 1: Swin Blocks × 2</text>
+          <text x="540" y="120" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#5C5B56">H/4 × W/4 × C</text>
+          <text x="540" y="140" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#9C9A94">56×56×96</text>
+
+          <line x1="400" y1="150" x2="400" y2="162" stroke="#9C9A94" stroke-width="1.5" marker-end="url(#ch18-arr3)"/>
+          <rect x="340" y="154" width="120" height="18" rx="4" fill="#F1EFE8" stroke="#C8C6BE" stroke-width="1"/>
+          <text x="400" y="167" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="500" fill="#5C5B56">Patch Merge ↓2</text>
+
+          <!-- Stage 2 -->
+          <rect x="170" y="178" width="460" height="50" rx="6" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1.5"/>
+          <text x="290" y="203" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="500" fill="#534AB7">Stage 2: Swin Blocks × 2</text>
+          <text x="520" y="198" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#5C5B56">H/8 × W/8 × 2C</text>
+          <text x="520" y="218" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#9C9A94">28×28×192</text>
+
+          <line x1="400" y1="228" x2="400" y2="240" stroke="#9C9A94" stroke-width="1.5" marker-end="url(#ch18-arr3)"/>
+          <rect x="340" y="232" width="120" height="18" rx="4" fill="#F1EFE8" stroke="#C8C6BE" stroke-width="1"/>
+          <text x="400" y="245" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="500" fill="#5C5B56">Patch Merge ↓2</text>
+
+          <!-- Stage 3 -->
+          <rect x="200" y="256" width="400" height="50" rx="6" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1.5"/>
+          <text x="310" y="281" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="500" fill="#534AB7">Stage 3: Swin Blocks × 6</text>
+          <text x="500" y="276" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#5C5B56">H/16 × W/16 × 4C</text>
+          <text x="500" y="296" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#9C9A94">14×14×384</text>
+
+          <line x1="400" y1="306" x2="400" y2="318" stroke="#9C9A94" stroke-width="1.5" marker-end="url(#ch18-arr3)"/>
+          <rect x="340" y="310" width="120" height="18" rx="4" fill="#F1EFE8" stroke="#C8C6BE" stroke-width="1"/>
+          <text x="400" y="323" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="500" fill="#5C5B56">Patch Merge ↓2</text>
+
+          <!-- Stage 4 -->
+          <rect x="230" y="334" width="340" height="50" rx="6" fill="#534AB7" stroke="#534AB7" rx="6"/>
+          <text x="320" y="359" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="500" fill="#FFFFFF">Stage 4: Swin Blocks × 2</text>
+          <text x="480" y="354" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#AFA9EC">H/32 × W/32 × 8C</text>
+          <text x="480" y="374" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#AFA9EC">7×7×768</text>
+
+          <!-- FPN taps on right side -->
+          <line x1="660" y1="125" x2="700" y2="125" stroke="#F0997B" stroke-width="1.5" marker-end="url(#ch18-arr3)"/>
+          <line x1="630" y1="203" x2="700" y2="203" stroke="#F0997B" stroke-width="1.5" marker-end="url(#ch18-arr3)"/>
+          <line x1="600" y1="281" x2="700" y2="281" stroke="#F0997B" stroke-width="1.5" marker-end="url(#ch18-arr3)"/>
+          <line x1="570" y1="359" x2="700" y2="359" stroke="#F0997B" stroke-width="1.5" marker-end="url(#ch18-arr3)"/>
+
+          <rect x="700" y="105" width="80" height="270" rx="6" fill="none" stroke="#F0997B" stroke-width="1.5" stroke-dasharray="5 4"/>
+          <text x="740" y="245" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="500" fill="#993C1D" transform="rotate(-90,740,245)">FPN / Detection Head</text>
+
+          <!-- ×N bracket for Swin-B config -->
+          <text x="80" y="200" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#9C9A94">Swin-T: C=96</text>
+          <text x="80" y="215" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#9C9A94">Swin-S: C=96</text>
+          <text x="80" y="230" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#9C9A94">Swin-B: C=128</text>
+          <text x="80" y="245" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#9C9A94">Swin-L: C=192</text>
+        </svg>
+        <figcaption>Figure 18.3 — The Swin Transformer's 4-stage hierarchical architecture. Each stage operates at half the spatial resolution and double the channel width of the previous stage, producing feature maps at ¼, ⅛, 1/16, and 1/32 resolution. Patch merging between stages concatenates 2×2 spatial neighbors and projects them down. All four stage outputs can be tapped by an FPN for detection or segmentation.</figcaption>
+      </figure>
+
+      <h3>Relative position bias</h3>
+
+      <p>Absolute positional embeddings, as used in the original ViT, encode where a token is in the global image. Swin instead uses **relative position bias**: a learned bias $B \in \mathbb{R}^{M^2 \times M^2}$ added to the attention logits before softmax, indexed by the relative spatial offset between each pair of tokens within a window. The attention computation becomes:</p>
+
+      $$\text{Attention}(Q, K, V) = \text{softmax}\!\left(\frac{QK^\top}{\sqrt{d_k}} + B\right)V$$
+
+      <p>where $QK^\top$ is a matrix multiply ($\mathbb{R}^{M^2 \times d_k} \times \mathbb{R}^{d_k \times M^2} \to \mathbb{R}^{M^2 \times M^2}$) computing pairwise similarity scores between all tokens in a window, and $B$ is indexed from a smaller learnable table $\hat{B} \in \mathbb{R}^{(2M-1) \times (2M-1)}$ since relative offsets in each axis range from $-(M-1)$ to $+(M-1)$. This bias is shared across all windows but is separate for each attention head, allowing different heads to learn different spatial priors.</p>
+
+      <p>The following code implements a complete Swin window attention block, including the windowing, relative position bias, and cyclic shift for the shifted variant.</p>
+
+<pre><code class="language-python">
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class SwinWindowAttention(nn.Module):
+    """Window-based multi-head self-attention with relative position bias."""
+    def __init__(self, dim: int, window_size: int = 7, num_heads: int = 3):
+        super().__init__()
+        self.window_size = window_size
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim ** -0.5
+        self.qkv = nn.Linear(dim, 3 * dim)
+        self.proj = nn.Linear(dim, dim)
+        # Relative position bias table: (2M-1)*(2M-1) entries per head
+        self.rel_pos_bias = nn.Parameter(
+            torch.zeros((2*window_size-1) * (2*window_size-1), num_heads)
+        )
+        nn.init.trunc_normal_(self.rel_pos_bias, std=0.02)
+        # Compute relative position index for a window
+        coords = torch.stack(torch.meshgrid(
+            torch.arange(window_size), torch.arange(window_size), indexing='ij'
+        ))  # (2, M, M)
+        coords = coords.reshape(2, -1)          # (2, M^2)
+        rel = coords[:, :, None] - coords[:, None, :]  # (2, M^2, M^2)
+        rel[0] += window_size - 1
+        rel[1] += window_size - 1
+        rel[0] *= 2 * window_size - 1
+        index = rel.sum(0)                      # (M^2, M^2)
+        self.register_buffer("rel_index", index)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (num_windows * batch, M^2, dim)
+        B_, N, C = x.shape
+        qkv = self.qkv(x).reshape(B_, N, 3, self.num_heads, self.head_dim)
+        qkv = qkv.permute(2, 0, 3, 1, 4)
+        Q, K, V = qkv.unbind(0)  # each (B_, heads, M^2, head_dim)
+        attn = (Q @ K.transpose(-2, -1)) * self.scale  # (B_, heads, M^2, M^2)
+        # Add relative position bias
+        bias = self.rel_pos_bias[self.rel_index.view(-1)].view(
+            N, N, -1).permute(2, 0, 1)  # (heads, M^2, M^2)
+        attn = attn + bias.unsqueeze(0)
+        attn = F.softmax(attn, dim=-1)
+        out = (attn @ V).transpose(1, 2).reshape(B_, N, C)  # (B_, M^2, dim)
+        return self.proj(out)
+</code></pre>
+
+      <h3>Model configurations</h3>
+
+      <p>Swin comes in four sizes designed to match the compute profiles of common ResNet variants. Swin-T (tiny, 29M parameters, 4.5 GFLOPs) targets the ResNet-50 regime. Swin-S (small, 50M) and Swin-B (base, 88M) scale the depth and channel width. Swin-L (large, 197M) pushes to the ResNet-200 class. On ImageNet-1K, Swin-B achieves 83.5% top-1 accuracy. On COCO object detection with Cascade Mask R-CNN, Swin-L achieves 58.7 box AP — at the time, a significant jump over both CNN and plain ViT backbones.</p>
+    </section>
+
+    <!-- ================================================================== -->
+    <!-- SECTION 3: SWIN TRANSFORMER V2                                     -->
+    <!-- ================================================================== -->
+    <section class="chapter-section" id="swin-v2">
+      <h2>Swin Transformer V2</h2>
+
+      <h3>Scaling instabilities and their fixes</h3>
+
+      <p>When Liu et al. scaled Swin to 3 billion parameters (SwinV2-G), three problems emerged. First, training became unstable at large scale with pre-normalization (LayerNorm before attention). The fix: switch to post-normalization with a residual-post-norm configuration. Second, dot-product attention logits grew excessively large, dominating certain heads. The fix: replace the dot-product similarity $q_i^\top k_j$ (dot product, yields a scalar) with **scaled cosine attention**:</p>
+
+      $$\text{Attention} = \text{softmax}\!\left(\frac{\cos(q_i, k_j)}{\tau} + \hat{B}\right)V$$
+
+      <p>where $\tau$ is a learnable scalar per attention head (initialized to 0.01 and clamped above 0.01 during training). Cosine similarity is bounded in $[-1, 1]$ regardless of vector magnitude, preventing the logit explosion that plagued the original scaled dot-product. Third, the discrete relative position bias table cannot transfer across window sizes — training at 192×192 with 12×12 windows and fine-tuning at 1536×1536 with 96×96 windows requires position biases the model has never seen. The fix: replace the discrete lookup table with a log-spaced continuous position bias generated by a small MLP that takes log-scaled relative coordinates as input, enabling smooth interpolation to arbitrary window sizes.</p>
+
+      <h3>Flash Window Attention</h3>
+
+      <p>In 2025, Zhang introduced an IO-aware CUDA kernel specifically optimized for the short-sequence, many-batch workload pattern of window attention. Standard FlashAttention is designed for long sequences; it tiles along the sequence dimension. Window attention processes many small windows (49 tokens each for $M = 7$) in parallel — a regime where sequence-dimension tiling is wasteful. Flash Window Attention tiles along the feature dimension instead, keeping all temporary data in on-chip SRAM. The result: a 3× speedup on the attention kernel and roughly 30% lower end-to-end latency for Swin-family models, with no change to model architecture or accuracy.</p>
+    </section>
+
+    <!-- ================================================================== -->
+    <!-- SECTION 4: PVT                                                     -->
+    <!-- ================================================================== -->
+    <section class="chapter-section" id="pvt">
+      <h2>PVT: Pyramid Vision Transformer</h2>
+
+      <p>Wang et al. (2021) took a different approach to making attention tractable at high resolution. Instead of restricting attention to local windows, PVT keeps global attention but reduces its cost by spatially downsampling the keys and values.</p>
+
+      <h3>Spatial-reduction attention</h3>
+
+      <p>In standard attention, the cost is $O(n^2 d)$ because every query attends to every key. In **spatial-reduction attention** (SRA), the key and value feature maps are spatially downsampled by a factor $R$ before computing attention. If the feature map has $n = H \times W$ tokens, the downsampled keys and values have $n/R^2$ tokens. The cost drops to $O(n \cdot n/R^2 \cdot d) = O(n^2 d / R^2)$. Crucially, the query operates at full resolution, so the output retains fine spatial detail — only the attention's receptive field is coarsened.</p>
+
+      <p>In early stages where spatial resolution is high, $R$ is large (e.g., $R = 8$), giving a 64× reduction. In later stages where resolution is lower, $R$ shrinks (e.g., $R = 1$, recovering full global attention). This progressive reduction matches the intuition that early features need local detail while late features need global context.</p>
+
+      <h3>PVT v2</h3>
+
+      <p>PVTv2 introduced two improvements. First, overlapping patch embeddings: instead of non-overlapping patches (which can create grid artifacts), PVTv2 uses a 3×3 depthwise convolution with stride 2 and padding 1 as its spatial downsampling operator, preserving richer spatial context at boundaries. Second, it replaces the linear projection used for spatial reduction with average pooling, which is parameter-free and achieves linear complexity $O(n \cdot d)$ in the number of tokens.</p>
+
+      <figure class="diagram-figure">
+        <svg width="100%" viewBox="0 0 800 280" xmlns="http://www.w3.org/2000/svg">
+          <!-- Three-panel comparison: Global, Window, Spatial-Reduction -->
+
+          <!-- Panel 1: Global Attention -->
+          <text x="130" y="24" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="600" fill="#993C1D">Global Attention</text>
+          <text x="130" y="40" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#9C9A94">O(n² d)</text>
+
+          <!-- 6×6 grid -->
+          <g transform="translate(40, 50)">
+            <!-- All cells light purple (all attendable) -->
+            <g fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1">
+              <rect x="0" y="0" width="30" height="30" rx="2"/>
+              <rect x="30" y="0" width="30" height="30" rx="2"/>
+              <rect x="60" y="0" width="30" height="30" rx="2"/>
+              <rect x="90" y="0" width="30" height="30" rx="2"/>
+              <rect x="120" y="0" width="30" height="30" rx="2"/>
+              <rect x="150" y="0" width="30" height="30" rx="2"/>
+              <rect x="0" y="30" width="30" height="30" rx="2"/>
+              <rect x="30" y="30" width="30" height="30" rx="2"/>
+              <rect x="60" y="30" width="30" height="30" rx="2"/>
+              <rect x="90" y="30" width="30" height="30" rx="2"/>
+              <rect x="120" y="30" width="30" height="30" rx="2"/>
+              <rect x="150" y="30" width="30" height="30" rx="2"/>
+              <rect x="0" y="60" width="30" height="30" rx="2"/>
+              <rect x="30" y="60" width="30" height="30" rx="2"/>
+              <rect x="60" y="60" width="30" height="30" rx="2"/>
+              <rect x="90" y="60" width="30" height="30" rx="2"/>
+              <rect x="120" y="60" width="30" height="30" rx="2"/>
+              <rect x="150" y="60" width="30" height="30" rx="2"/>
+              <rect x="0" y="90" width="30" height="30" rx="2"/>
+              <rect x="30" y="90" width="30" height="30" rx="2"/>
+              <rect x="60" y="90" width="30" height="30" rx="2"/>
+              <rect x="90" y="90" width="30" height="30" rx="2"/>
+              <rect x="120" y="90" width="30" height="30" rx="2"/>
+              <rect x="150" y="90" width="30" height="30" rx="2"/>
+              <rect x="0" y="120" width="30" height="30" rx="2"/>
+              <rect x="30" y="120" width="30" height="30" rx="2"/>
+              <rect x="60" y="120" width="30" height="30" rx="2"/>
+              <rect x="90" y="120" width="30" height="30" rx="2"/>
+              <rect x="120" y="120" width="30" height="30" rx="2"/>
+              <rect x="150" y="120" width="30" height="30" rx="2"/>
+              <rect x="0" y="150" width="30" height="30" rx="2"/>
+              <rect x="30" y="150" width="30" height="30" rx="2"/>
+              <rect x="60" y="150" width="30" height="30" rx="2"/>
+              <rect x="90" y="150" width="30" height="30" rx="2"/>
+              <rect x="120" y="150" width="30" height="30" rx="2"/>
+              <rect x="150" y="150" width="30" height="30" rx="2"/>
+            </g>
+            <!-- Query token highlighted -->
+            <rect x="60" y="60" width="30" height="30" rx="2" fill="#534AB7" stroke="#534AB7"/>
+            <text x="75" y="80" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="500" fill="#FFFFFF">q</text>
+          </g>
+          <text x="130" y="245" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#534AB7">All 36 tokens attendable</text>
+
+          <!-- Panel 2: Window Attention (Swin) -->
+          <text x="400" y="24" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="600" fill="#0F6E56">Window Attention (Swin)</text>
+          <text x="400" y="40" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#9C9A94">O(M² · n · d)</text>
+
+          <g transform="translate(310, 50)">
+            <!-- Top-left window: attendable (purple) -->
+            <g fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1">
+              <rect x="0" y="0" width="30" height="30" rx="2"/>
+              <rect x="30" y="0" width="30" height="30" rx="2"/>
+              <rect x="60" y="0" width="30" height="30" rx="2"/>
+              <rect x="0" y="30" width="30" height="30" rx="2"/>
+              <rect x="30" y="30" width="30" height="30" rx="2"/>
+              <rect x="60" y="30" width="30" height="30" rx="2"/>
+              <rect x="0" y="60" width="30" height="30" rx="2"/>
+              <rect x="30" y="60" width="30" height="30" rx="2"/>
+              <rect x="60" y="60" width="30" height="30" rx="2"/>
+            </g>
+            <!-- Other windows: gray (not attendable) -->
+            <g fill="#F1EFE8" stroke="#C8C6BE" stroke-width="0.5">
+              <rect x="90" y="0" width="30" height="30" rx="2"/>
+              <rect x="120" y="0" width="30" height="30" rx="2"/>
+              <rect x="150" y="0" width="30" height="30" rx="2"/>
+              <rect x="90" y="30" width="30" height="30" rx="2"/>
+              <rect x="120" y="30" width="30" height="30" rx="2"/>
+              <rect x="150" y="30" width="30" height="30" rx="2"/>
+              <rect x="90" y="60" width="30" height="30" rx="2"/>
+              <rect x="120" y="60" width="30" height="30" rx="2"/>
+              <rect x="150" y="60" width="30" height="30" rx="2"/>
+              <rect x="0" y="90" width="30" height="30" rx="2"/>
+              <rect x="30" y="90" width="30" height="30" rx="2"/>
+              <rect x="60" y="90" width="30" height="30" rx="2"/>
+              <rect x="90" y="90" width="30" height="30" rx="2"/>
+              <rect x="120" y="90" width="30" height="30" rx="2"/>
+              <rect x="150" y="90" width="30" height="30" rx="2"/>
+              <rect x="0" y="120" width="30" height="30" rx="2"/>
+              <rect x="30" y="120" width="30" height="30" rx="2"/>
+              <rect x="60" y="120" width="30" height="30" rx="2"/>
+              <rect x="90" y="120" width="30" height="30" rx="2"/>
+              <rect x="120" y="120" width="30" height="30" rx="2"/>
+              <rect x="150" y="120" width="30" height="30" rx="2"/>
+              <rect x="0" y="150" width="30" height="30" rx="2"/>
+              <rect x="30" y="150" width="30" height="30" rx="2"/>
+              <rect x="60" y="150" width="30" height="30" rx="2"/>
+              <rect x="90" y="150" width="30" height="30" rx="2"/>
+              <rect x="120" y="150" width="30" height="30" rx="2"/>
+              <rect x="150" y="150" width="30" height="30" rx="2"/>
+            </g>
+            <!-- Window borders -->
+            <rect x="0" y="0" width="90" height="90" rx="3" fill="none" stroke="#534AB7" stroke-width="2"/>
+            <rect x="90" y="0" width="90" height="90" rx="3" fill="none" stroke="#C8C6BE" stroke-width="1" stroke-dasharray="3 2"/>
+            <rect x="0" y="90" width="90" height="90" rx="3" fill="none" stroke="#C8C6BE" stroke-width="1" stroke-dasharray="3 2"/>
+            <rect x="90" y="90" width="90" height="90" rx="3" fill="none" stroke="#C8C6BE" stroke-width="1" stroke-dasharray="3 2"/>
+            <!-- Query -->
+            <rect x="30" y="30" width="30" height="30" rx="2" fill="#534AB7" stroke="#534AB7"/>
+            <text x="45" y="50" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="500" fill="#FFFFFF">q</text>
+          </g>
+          <text x="400" y="245" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#0F6E56">Only 9 tokens in window</text>
+
+          <!-- Panel 3: Spatial-Reduction (PVT) -->
+          <text x="670" y="24" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="600" fill="#854F0B">Spatial-Reduction (PVT)</text>
+          <text x="670" y="40" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#9C9A94">O(n² d / R²)</text>
+
+          <g transform="translate(580, 50)">
+            <!-- Downsampled K/V: 3×3 large cells (amber) -->
+            <g fill="#FAEEDA" stroke="#EF9F27" stroke-width="1.5">
+              <rect x="0" y="0" width="60" height="60" rx="3"/>
+              <rect x="60" y="0" width="60" height="60" rx="3"/>
+              <rect x="120" y="0" width="60" height="60" rx="3"/>
+              <rect x="0" y="60" width="60" height="60" rx="3"/>
+              <rect x="60" y="60" width="60" height="60" rx="3"/>
+              <rect x="120" y="60" width="60" height="60" rx="3"/>
+              <rect x="0" y="120" width="60" height="60" rx="3"/>
+              <rect x="60" y="120" width="60" height="60" rx="3"/>
+              <rect x="120" y="120" width="60" height="60" rx="3"/>
+            </g>
+            <!-- Query at full res (small purple dot) -->
+            <rect x="60" y="60" width="15" height="15" rx="2" fill="#534AB7" stroke="#534AB7"/>
+            <text x="68" y="58" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="500" fill="#534AB7">q</text>
+            <!-- K/V labels -->
+            <text x="30" y="35" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#854F0B">K,V</text>
+          </g>
+          <text x="670" y="245" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#854F0B">Full-res Q, downsampled K/V</text>
+          <text x="670" y="258" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#854F0B">(R=2 → 9 K/V tokens)</text>
+        </svg>
+        <figcaption>Figure 18.4 — Three strategies for managing attention cost in hierarchical vision transformers. Left: global attention attends to all tokens (O(n²)). Center: Swin window attention restricts each query to its local M×M window. Right: PVT spatial-reduction attention keeps queries at full resolution but downsamples keys and values by factor R, reducing cost by R²×.</figcaption>
+      </figure>
+    </section>
+
+    <!-- ================================================================== -->
+    <!-- SECTION 5: BEiT                                                    -->
+    <!-- ================================================================== -->
+    <section class="chapter-section" id="beit">
+      <h2>BEiT: Masked Image Modeling for Hierarchical Backbones</h2>
+
+      <h3>Discrete visual tokens</h3>
+
+      <p>While Swin and PVT focused on the architecture, BEiT (Bao et al., 2021) asked a different question: how should we pretrain a hierarchical vision transformer? Inspired by BERT's masked language modeling, BEiT masks random patches of an image and trains the model to predict what was masked. But instead of predicting raw pixels (as MAE does, covered in Chapter 17), BEiT predicts discrete visual tokens — integer codes produced by a pretrained discrete variational autoencoder (dVAE) from DALL-E. Each 16×16 patch maps to one of 8192 possible tokens. This turns the pretraining task into a classification problem over a visual vocabulary, mirroring how BERT predicts word tokens from a text vocabulary.</p>
+
+      <h3>BEiT v2 and BEiT-3</h3>
+
+      <p>BEiT v2 replaced the DALL-E dVAE with a vector-quantized visual tokenizer trained on a richer codebook, producing higher-quality prediction targets. The key insight: the quality of the masked prediction targets directly controls the quality of learned representations. A weak tokenizer produces noisy targets; a strong tokenizer forces the model to learn fine-grained visual semantics.</p>
+
+      <p>BEiT-3 extended the framework to multimodal pretraining, treating images as a "foreign language" — feeding image tokens alongside text tokens into a shared transformer and training with masked prediction on both modalities. BEiT-3 demonstrated strong zero-shot transfer across vision, language, and vision-language tasks. No BEiT-4 has been released; the research line appears to have plateaued as other multimodal pretraining approaches (InternVL, SigLIP) gained momentum.</p>
+    </section>
+
+    <!-- ================================================================== -->
+    <!-- SECTION 6: HIERA                                                   -->
+    <!-- ================================================================== -->
+    <section class="chapter-section" id="hiera">
+      <h2>Hiera: Simplicity Wins</h2>
+
+      <p>By 2023, hierarchical vision transformers had accumulated considerable architectural complexity: shifted windows, relative position biases, learned window sizes, convolutional position encodings. Ryali et al. at Meta asked a provocative question: how much of this complexity is actually necessary?</p>
+
+      <h3>The simplification thesis</h3>
+
+      <p>Hiera starts with a plain ViT and adds only the bare minimum for hierarchical features: a multi-stage structure with patch merging between stages (exactly like Swin) and local attention in early stages (unshifted, non-overlapping windows — no shifting, no masking tricks). Later stages use global attention over the smaller feature maps. There is no relative position bias, no shifted window scheme, and no convolutional position encoding. The architecture is almost embarrassingly simple compared to Swin.</p>
+
+      <h3>MAE pretraining as the missing ingredient</h3>
+
+      <p>Without strong pretraining, this simplified architecture underperforms Swin — the removed components were not useless. But with MAE pretraining (the same masked autoencoder approach from Chapter 17), Hiera matches or exceeds Swin's accuracy on ImageNet, COCO, and ADE20K while being 2.4× faster on images and 5.1× faster on video. The window management overhead — cyclic shifts, attention masks for boundary windows, the relative position bias table lookup — adds up, especially in video where the number of tokens is much larger.</p>
+
+      <p>The following code shows the core difference: Hiera uses unshifted local attention in early stages and standard global attention in later stages, with no positional bias.</p>
+
+<pre><code class="language-python">
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+def window_partition(x: torch.Tensor, win: int) -> torch.Tensor:
+    """Partition (B, H, W, C) into (B * num_windows, win*win, C)."""
+    B, H, W, C = x.shape
+    x = x.view(B, H // win, win, W // win, win, C)
+    x = x.permute(0, 1, 3, 2, 4, 5).reshape(-1, win * win, C)
+    return x  # (B * nH * nW, win^2, C)
+
+def window_unpartition(x: torch.Tensor, win: int, H: int, W: int) -> torch.Tensor:
+    """Reverse of window_partition → (B, H, W, C)."""
+    B_wins = x.shape[0]
+    nH, nW = H // win, W // win
+    B = B_wins // (nH * nW)
+    x = x.view(B, nH, nW, win, win, -1)
+    return x.permute(0, 1, 3, 2, 4, 5).reshape(B, H, W, -1)
+
+class HieraAttention(nn.Module):
+    """Hiera-style attention: local windows (early) or global (late)."""
+    def __init__(self, dim: int, num_heads: int, window_size: int = 0):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim ** -0.5
+        self.window_size = window_size  # 0 = global attention
+        self.qkv = nn.Linear(dim, 3 * dim)
+        self.proj = nn.Linear(dim, dim)
+
+    def forward(self, x: torch.Tensor, H: int, W: int) -> torch.Tensor:
+        B, N, C = x.shape  # (batch, H*W, dim)
+        use_windows = self.window_size > 0
+        if use_windows:
+            x = x.view(B, H, W, C)
+            x = window_partition(x, self.window_size)  # (B*nW, win^2, C)
+        qkv = self.qkv(x).reshape(x.shape[0], x.shape[1], 3, self.num_heads, self.head_dim)
+        Q, K, V = qkv.permute(2, 0, 3, 1, 4).unbind(0)
+        attn = F.softmax((Q @ K.transpose(-2, -1)) * self.scale, dim=-1)
+        out = (attn @ V).transpose(1, 2).reshape(x.shape[0], x.shape[1], C)
+        out = self.proj(out)
+        if use_windows:
+            out = window_unpartition(out, self.window_size, H, W)
+            out = out.view(B, N, C)
+        return out  # (batch, H*W, dim)
+
+# Usage: early stage uses local windows, late stage uses global
+early_attn = HieraAttention(dim=96, num_heads=3, window_size=7)
+late_attn = HieraAttention(dim=768, num_heads=12, window_size=0)
+</code></pre>
+
+      <h3>Hiera in SAM 2</h3>
+
+      <p>Meta adopted Hiera as the vision encoder for SAM 2 (Segment Anything Model 2), replacing the plain ViT-H backbone from SAM 1. The multi-scale features from Hiera's four stages feed directly into SAM 2's mask decoder, enabling stride-4 through stride-32 features without an FPN. The result: SAM 2 runs at 130 FPS with Hiera-B+ on 1024×1024 inputs — 6× faster than SAM 1 — while achieving better segmentation quality. This is the most prominent real-world deployment of a hierarchical vision transformer, validating that the multi-scale design pattern is essential for dense prediction at production speed.</p>
+
+      <figure class="diagram-figure">
+        <svg width="100%" viewBox="0 0 800 380" xmlns="http://www.w3.org/2000/svg">
+          <!-- Swin vs Hiera comparison -->
+          <text x="400" y="24" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="14" font-weight="600" fill="#1A1A18">Swin vs Hiera: What Was Removed</text>
+
+          <!-- Swin column -->
+          <text x="210" y="54" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="13" font-weight="600" fill="#534AB7">Swin Transformer</text>
+
+          <rect x="80" y="68" width="260" height="34" rx="6" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1.5"/>
+          <text x="210" y="90" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="500" fill="#534AB7">4-stage hierarchy + patch merge</text>
+
+          <rect x="80" y="108" width="260" height="34" rx="6" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1.5"/>
+          <text x="210" y="130" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="500" fill="#534AB7">Local window attention (M=7)</text>
+
+          <rect x="80" y="148" width="260" height="34" rx="6" fill="#FAEEDA" stroke="#EF9F27" stroke-width="1.5"/>
+          <text x="210" y="170" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="500" fill="#854F0B">Shifted window scheme</text>
+
+          <rect x="80" y="188" width="260" height="34" rx="6" fill="#FAEEDA" stroke="#EF9F27" stroke-width="1.5"/>
+          <text x="210" y="210" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="500" fill="#854F0B">Relative position bias table</text>
+
+          <rect x="80" y="228" width="260" height="34" rx="6" fill="#FAEEDA" stroke="#EF9F27" stroke-width="1.5"/>
+          <text x="210" y="250" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="500" fill="#854F0B">Attention masking for cyclic shift</text>
+
+          <!-- Hiera column -->
+          <text x="590" y="54" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="13" font-weight="600" fill="#0F6E56">Hiera</text>
+
+          <rect x="460" y="68" width="260" height="34" rx="6" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1.5"/>
+          <text x="590" y="90" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="500" fill="#0F6E56">4-stage hierarchy + patch merge</text>
+
+          <rect x="460" y="108" width="260" height="34" rx="6" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1.5"/>
+          <text x="590" y="130" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="500" fill="#0F6E56">Local window attention (no shift)</text>
+
+          <!-- Removed items shown as ghost boxes -->
+          <rect x="460" y="148" width="260" height="34" rx="6" fill="none" stroke="#C8C6BE" stroke-width="1" stroke-dasharray="4 3"/>
+          <text x="590" y="170" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="400" fill="#C8C6BE" text-decoration="line-through">Shifted window scheme</text>
+          <text x="730" y="170" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="14" font-weight="700" fill="#993C1D">✕</text>
+
+          <rect x="460" y="188" width="260" height="34" rx="6" fill="none" stroke="#C8C6BE" stroke-width="1" stroke-dasharray="4 3"/>
+          <text x="590" y="210" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="400" fill="#C8C6BE" text-decoration="line-through">Relative position bias</text>
+          <text x="730" y="210" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="14" font-weight="700" fill="#993C1D">✕</text>
+
+          <rect x="460" y="228" width="260" height="34" rx="6" fill="none" stroke="#C8C6BE" stroke-width="1" stroke-dasharray="4 3"/>
+          <text x="590" y="250" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="400" fill="#C8C6BE" text-decoration="line-through">Attention masking</text>
+          <text x="730" y="250" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="14" font-weight="700" fill="#993C1D">✕</text>
+
+          <!-- Late-stage global attention (Hiera addition) -->
+          <rect x="460" y="268" width="260" height="34" rx="6" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1.5"/>
+          <text x="590" y="290" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="500" fill="#0F6E56">Global attention in late stages</text>
+
+          <!-- Speed comparison bars -->
+          <text x="400" y="330" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="600" fill="#1A1A18">Throughput (images/sec, ImageNet)</text>
+
+          <rect x="120" y="340" width="180" height="18" rx="4" fill="#AFA9EC" stroke="none"/>
+          <text x="125" y="353" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="500" fill="#FFFFFF">Swin-B: 462</text>
+
+          <rect x="500" y="340" width="250" height="18" rx="4" fill="#5DCAA5" stroke="none"/>
+          <text x="505" y="353" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="500" fill="#FFFFFF">Hiera-B: 1108 (2.4× faster)</text>
+        </svg>
+        <figcaption>Figure 18.5 — Swin vs Hiera: what was kept and what was removed. Both share the 4-stage hierarchy and local window attention. Hiera drops the shifted window scheme, relative position bias, and attention masking. It adds global attention in late stages. With MAE pretraining, Hiera matches Swin's accuracy at 2.4× the throughput on images.</figcaption>
+      </figure>
+
+      <div class="callout callout-insight">
+        <div class="callout-title">Key Insight</div>
+        <p>Hiera's core lesson is that architectural complexity and training methodology are not independent. Shifted windows, relative position bias, and careful window management were necessary when training Swin with supervised labels on ImageNet-1K. With MAE pretraining, a plain hierarchical ViT with unshifted local attention recovers the same accuracy at 2.4× the speed. The architecture you need depends on the pretraining you can afford.</p>
+      </div>
+    </section>
+
+    <!-- ================================================================== -->
+    <!-- SECTION 7: FASTERIT AND EFFICIENT HIERARCHICAL DESIGNS             -->
+    <!-- ================================================================== -->
+    <section class="chapter-section" id="efficient-hierarchical">
+      <h2>FasterViT and Efficient Hierarchical Designs</h2>
+
+      <p>The Swin template — multi-stage hierarchy with local attention — spawned a wave of designs optimizing for different deployment targets. Four are particularly notable.</p>
+
+      <h3>FasterViT: carrier tokens for global context</h3>
+
+      <p>The fundamental limitation of window attention is that tokens in one window cannot see tokens in distant windows. Swin's shifted-window scheme provides cross-window communication, but only between adjacent windows and only in alternating layers. FasterViT (Hatamizadeh et al., ICLR 2024) introduces a more direct solution: **carrier tokens**. Each window is augmented with a small number of dedicated carrier tokens that participate in local window attention alongside the regular patch tokens. After the local attention step, all carrier tokens (from every window) participate in a separate global attention step among themselves only. The carriers then return to their windows carrying global context. This two-step process — local attention with carriers, then global attention among carriers — gives every window access to information from every other window at a cost of $O(K^2)$ for $K$ carrier tokens, which is much smaller than global attention over all tokens.</p>
+
+      <figure class="diagram-figure">
+        <svg width="100%" viewBox="0 0 800 340" xmlns="http://www.w3.org/2000/svg">
+          <defs>
+            <marker id="ch18-arr6" viewBox="0 0 10 10" refX="9" refY="5"
+              markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+              <path d="M1 1L9 5L1 9" fill="none" stroke="context-stroke"
+                stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+            </marker>
+          </defs>
+
+          <!-- Step 1: Local attention with carriers -->
+          <text x="200" y="24" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="13" font-weight="600" fill="#534AB7">Step 1: Local Attention (with carriers)</text>
+
+          <!-- Window 1 -->
+          <rect x="30" y="40" width="160" height="110" rx="6" fill="none" stroke="#C8C6BE" stroke-width="1" stroke-dasharray="5 4"/>
+          <!-- Patch tokens -->
+          <circle cx="60" cy="70" r="12" fill="#F1EFE8" stroke="#C8C6BE" stroke-width="1"/>
+          <circle cx="90" cy="70" r="12" fill="#F1EFE8" stroke="#C8C6BE" stroke-width="1"/>
+          <circle cx="120" cy="70" r="12" fill="#F1EFE8" stroke="#C8C6BE" stroke-width="1"/>
+          <circle cx="150" cy="70" r="12" fill="#F1EFE8" stroke="#C8C6BE" stroke-width="1"/>
+          <circle cx="60" cy="100" r="12" fill="#F1EFE8" stroke="#C8C6BE" stroke-width="1"/>
+          <circle cx="90" cy="100" r="12" fill="#F1EFE8" stroke="#C8C6BE" stroke-width="1"/>
+          <circle cx="120" cy="100" r="12" fill="#F1EFE8" stroke="#C8C6BE" stroke-width="1"/>
+          <circle cx="150" cy="100" r="12" fill="#F1EFE8" stroke="#C8C6BE" stroke-width="1"/>
+          <!-- Carrier token -->
+          <circle cx="105" cy="130" r="14" fill="#FAEEDA" stroke="#EF9F27" stroke-width="2"/>
+          <text x="105" y="135" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="600" fill="#854F0B">C</text>
+          <!-- Attention lines from carrier to patches -->
+          <line x1="95" y1="120" x2="65" y2="80" stroke="#AFA9EC" stroke-width="0.8" opacity="0.5"/>
+          <line x1="100" y1="118" x2="92" y2="80" stroke="#AFA9EC" stroke-width="0.8" opacity="0.5"/>
+          <line x1="108" y1="118" x2="118" y2="80" stroke="#AFA9EC" stroke-width="0.8" opacity="0.5"/>
+          <line x1="113" y1="120" x2="148" y2="80" stroke="#AFA9EC" stroke-width="0.8" opacity="0.5"/>
+
+          <!-- Window 2 -->
+          <rect x="210" y="40" width="160" height="110" rx="6" fill="none" stroke="#C8C6BE" stroke-width="1" stroke-dasharray="5 4"/>
+          <circle cx="240" cy="70" r="12" fill="#F1EFE8" stroke="#C8C6BE" stroke-width="1"/>
+          <circle cx="270" cy="70" r="12" fill="#F1EFE8" stroke="#C8C6BE" stroke-width="1"/>
+          <circle cx="300" cy="70" r="12" fill="#F1EFE8" stroke="#C8C6BE" stroke-width="1"/>
+          <circle cx="330" cy="70" r="12" fill="#F1EFE8" stroke="#C8C6BE" stroke-width="1"/>
+          <circle cx="240" cy="100" r="12" fill="#F1EFE8" stroke="#C8C6BE" stroke-width="1"/>
+          <circle cx="270" cy="100" r="12" fill="#F1EFE8" stroke="#C8C6BE" stroke-width="1"/>
+          <circle cx="300" cy="100" r="12" fill="#F1EFE8" stroke="#C8C6BE" stroke-width="1"/>
+          <circle cx="330" cy="100" r="12" fill="#F1EFE8" stroke="#C8C6BE" stroke-width="1"/>
+          <circle cx="285" cy="130" r="14" fill="#FAEEDA" stroke="#EF9F27" stroke-width="2"/>
+          <text x="285" y="135" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="600" fill="#854F0B">C</text>
+
+          <!-- Arrow between steps -->
+          <line x1="395" y1="100" x2="435" y2="100" stroke="#534AB7" stroke-width="2" marker-end="url(#ch18-arr6)"/>
+
+          <!-- Step 2: Global attention among carriers -->
+          <text x="620" y="24" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="13" font-weight="600" fill="#854F0B">Step 2: Global Carrier Attention</text>
+
+          <!-- Just the carriers, connected -->
+          <circle cx="490" cy="100" r="16" fill="#FAEEDA" stroke="#EF9F27" stroke-width="2"/>
+          <text x="490" y="105" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="600" fill="#854F0B">C₁</text>
+
+          <circle cx="570" cy="100" r="16" fill="#FAEEDA" stroke="#EF9F27" stroke-width="2"/>
+          <text x="570" y="105" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="600" fill="#854F0B">C₂</text>
+
+          <circle cx="650" cy="100" r="16" fill="#FAEEDA" stroke="#EF9F27" stroke-width="2"/>
+          <text x="650" y="105" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="600" fill="#854F0B">C₃</text>
+
+          <circle cx="730" cy="100" r="16" fill="#FAEEDA" stroke="#EF9F27" stroke-width="2"/>
+          <text x="730" y="105" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="600" fill="#854F0B">C₄</text>
+
+          <!-- Full attention connections between carriers -->
+          <line x1="506" y1="97" x2="554" y2="97" stroke="#993C1D" stroke-width="2"/>
+          <line x1="586" y1="97" x2="634" y2="97" stroke="#993C1D" stroke-width="2"/>
+          <line x1="506" y1="103" x2="634" y2="103" stroke="#993C1D" stroke-width="1.5" opacity="0.6"/>
+          <line x1="586" y1="103" x2="714" y2="103" stroke="#993C1D" stroke-width="1.5" opacity="0.6"/>
+          <line x1="506" y1="90" x2="714" y2="90" stroke="#993C1D" stroke-width="1" opacity="0.4"/>
+          <line x1="666" y1="97" x2="714" y2="97" stroke="#993C1D" stroke-width="2"/>
+
+          <!-- Step 3: Return to windows -->
+          <text x="400" y="180" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="13" font-weight="600" fill="#0F6E56">Step 3: Carriers return with global context</text>
+
+          <!-- Windows with enriched carriers -->
+          <rect x="80" y="200" width="130" height="80" rx="6" fill="none" stroke="#C8C6BE" stroke-width="1" stroke-dasharray="5 4"/>
+          <circle cx="110" cy="230" r="10" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1"/>
+          <circle cx="135" cy="230" r="10" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1"/>
+          <circle cx="160" cy="230" r="10" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1"/>
+          <circle cx="180" cy="230" r="10" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1"/>
+          <circle cx="145" cy="258" r="13" fill="#0F6E56" stroke="#0F6E56" stroke-width="1"/>
+          <text x="145" y="262" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="600" fill="#FFFFFF">C₁✓</text>
+
+          <rect x="240" y="200" width="130" height="80" rx="6" fill="none" stroke="#C8C6BE" stroke-width="1" stroke-dasharray="5 4"/>
+          <circle cx="270" cy="230" r="10" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1"/>
+          <circle cx="295" cy="230" r="10" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1"/>
+          <circle cx="320" cy="230" r="10" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1"/>
+          <circle cx="340" cy="230" r="10" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1"/>
+          <circle cx="305" cy="258" r="13" fill="#0F6E56" stroke="#0F6E56" stroke-width="1"/>
+          <text x="305" y="262" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="600" fill="#FFFFFF">C₂✓</text>
+
+          <rect x="400" y="200" width="130" height="80" rx="6" fill="none" stroke="#C8C6BE" stroke-width="1" stroke-dasharray="5 4"/>
+          <circle cx="430" cy="230" r="10" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1"/>
+          <circle cx="455" cy="230" r="10" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1"/>
+          <circle cx="480" cy="230" r="10" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1"/>
+          <circle cx="500" cy="230" r="10" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1"/>
+          <circle cx="465" cy="258" r="13" fill="#0F6E56" stroke="#0F6E56" stroke-width="1"/>
+          <text x="465" y="262" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="600" fill="#FFFFFF">C₃✓</text>
+
+          <rect x="560" y="200" width="130" height="80" rx="6" fill="none" stroke="#C8C6BE" stroke-width="1" stroke-dasharray="5 4"/>
+          <circle cx="590" cy="230" r="10" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1"/>
+          <circle cx="615" cy="230" r="10" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1"/>
+          <circle cx="640" cy="230" r="10" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1"/>
+          <circle cx="660" cy="230" r="10" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1"/>
+          <circle cx="625" cy="258" r="13" fill="#0F6E56" stroke="#0F6E56" stroke-width="1"/>
+          <text x="625" y="262" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="600" fill="#FFFFFF">C₄✓</text>
+
+          <text x="400" y="310" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#9C9A94">Every window now has access to global information through its carrier token</text>
+        </svg>
+        <figcaption>Figure 18.6 — FasterViT's carrier token mechanism. Step 1: each window runs local attention including a dedicated carrier token (amber). Step 2: all carriers participate in global attention among themselves only (red connections). Step 3: carriers return to their windows enriched with global context (green), which patch tokens access in the next local attention round.</figcaption>
+      </figure>
+
+      <h3>EfficientViT: multi-scale linear attention</h3>
+
+      <p>EfficientViT (Cai et al., MIT Han Lab) replaces softmax attention entirely with multi-scale linear attention — using different depthwise convolution kernel sizes to capture local features at multiple scales, combined with a global linear attention mechanism. The result is an architecture that achieves a global receptive field using only hardware-efficient operations (no softmax, no division). EfficientViT provides up to 8.8× GPU latency reduction over SegFormer and was adopted as the backbone in Grounding DINO 1.5 Edge for real-time open-vocabulary detection.</p>
+
+      <h3>FastViT: structural reparameterization for mobile</h3>
+
+      <p>Apple's FastViT takes the mobile deployment angle. Its key trick is **RepMixer**: a token-mixing layer that uses skip connections during training (for gradient flow) but reparameterizes them away at inference (for speed). At inference time, the entire token-mixing block collapses into a single depthwise convolution — no skip connections, no extra memory accesses. FastViT is 3.5× faster than CMT and 4.9× faster than EfficientNet on mobile hardware, demonstrating that hierarchical ViTs can be competitive on phones and edge devices.</p>
+
+      <h3>TransNeXt: biomimetic attention</h3>
+
+      <p>TransNeXt (Shi, CVPR 2024) draws inspiration from human foveal vision: fine-grained attention to nearby tokens (the fovea) combined with coarse-grained attention to distant tokens (the periphery). This **aggregated attention** mechanism captures both local detail and global context in a single attention pass, without the two-step process of FasterViT's carrier tokens. TransNeXt-Tiny achieves 84.0% ImageNet accuracy, surpassing ConvNeXt-B with 69% fewer parameters.</p>
+    </section>
+
+    <!-- ================================================================== -->
+    <!-- SECTION 8: LINEAR ATTENTION REVIVAL                                -->
+    <!-- ================================================================== -->
+    <section class="chapter-section" id="linear-attention">
+      <h2>Linear Attention Revival</h2>
+
+      <h3>The distribution collapse problem</h3>
+
+      <p>Linear attention replaces the softmax in standard attention with an element-wise feature map $\phi$, rewriting the computation as:</p>
+
+      $$\text{Attn}_{\text{linear}}(Q, K, V) = \phi(Q)\bigl(\phi(K)^\top V\bigr)$$
+
+      <p>where $\phi(K)^\top V$ is a matrix multiply ($\mathbb{R}^{d \times n} \times \mathbb{R}^{n \times d} \to \mathbb{R}^{d \times d}$) that can be precomputed once and reused for every query, reducing complexity from $O(n^2 d)$ to $O(n d^2)$. When $d \ll n$ (as in high-resolution vision), this is a major win. The problem: without softmax normalization, the attention distribution collapses. Every query produces nearly the same output regardless of content, because the linear kernel cannot concentrate attention on specific keys. The model degenerates into computing a global average.</p>
+
+      <h3>L2ViT: local concentration as the fix</h3>
+
+      <p>L2ViT (Zheng et al., 2025) diagnoses the root cause: linear attention lacks the ability to produce sharp, position-specific attention distributions. The fix is to alternate enhanced linear global attention with standard softmax local window attention. The local window layers provide the sharp, concentrated distributions that linear attention cannot, while the global linear layers provide the long-range dependencies that window attention cannot. The combination achieves 84.4% ImageNet-1K top-1 accuracy (87.0% with ImageNet-22K pretraining at 384 resolution), demonstrating that softmax is not strictly necessary for competitive hierarchical vision backbones — but you need a local sharpening mechanism to compensate for what linear attention loses.</p>
+    </section>
+
+    <!-- ================================================================== -->
+    <!-- SECTION 9: ATTENTION-FREE HIERARCHICAL BACKBONES                   -->
+    <!-- ================================================================== -->
+    <section class="chapter-section" id="attention-free">
+      <h2>Attention-Free Hierarchical Backbones</h2>
+
+      <p>The hierarchical multi-stage design pattern — progressive spatial downsampling, increasing channel width, multi-scale feature outputs — turns out to be more fundamental than the attention mechanism itself. Several architectures demonstrate this by replacing attention entirely while keeping the hierarchical shell.</p>
+
+      <h3>FocalNet: focal modulation</h3>
+
+      <p>FocalNet (Yang et al., NeurIPS 2022) replaces self-attention with **focal modulation**: a sequence of depth-wise convolutions at increasing dilation rates captures context at multiple spatial scales, a gating mechanism aggregates these multi-scale features into a single context vector per token, and an element-wise modulation (the context vector multiplied element-wise with the token's query projection: $g_i \odot q_i$, Hadamard product, both vectors $\in \mathbb{R}^{d}$) produces the output. No queries, no keys, no softmax — yet FocalNet outperforms Swin at comparable compute across ImageNet, COCO, and ADE20K.</p>
+
+      <h3>Vision KAN</h3>
+
+      <p>Vision KAN (2026) pushes even further from the transformer paradigm by building a 4-stage hierarchical backbone using Kolmogorov-Arnold Network (KAN) modules instead of either attention or convolution. Each stage uses patch-wise nonlinear modeling with radial basis function KANs, axis-wise separable depth-wise convolutions for spatial mixing, and a low-rank global path for long-range dependencies. The architecture is early-stage and not yet competitive with mature designs, but it demonstrates a striking point: the hierarchical 4-stage design pioneered by Swin has become a universal backbone template that transcends the specific token-mixing mechanism.</p>
+    </section>
+
+    <!-- ================================================================== -->
+    <!-- SECTION 10: MAMBA-TRANSFORMER HYBRIDS                              -->
+    <!-- ================================================================== -->
+    <section class="chapter-section" id="mamba-hybrids">
+      <h2>Mamba-Transformer Hybrids</h2>
+
+      <p>State-space models (SSMs) offer a fundamentally different approach to sequence modeling: instead of computing pairwise attention between all tokens, an SSM maintains a fixed-size hidden state that summarizes everything seen so far, processing tokens in a single linear scan. Mamba's selective scan variant adds input-dependent gating, allowing the model to choose what to remember and what to forget. The challenge for vision: images are 2D, but Mamba processes 1D sequences. We give a brief treatment here; Part VIII covers SSMs in depth.</p>
+
+      <h3>VMamba and 2D selective scan</h3>
+
+      <p>VMamba (Liu et al., NeurIPS 2024) bridges the 1D-to-2D gap with a **four-way scanning** mechanism. A 2D feature map is linearized into four 1D sequences — left-to-right, right-to-left, top-to-bottom, bottom-to-top — and each is processed by a separate Mamba selective scan. The four outputs are merged (typically summed). This ensures that every token has a scan path connecting it to every other token regardless of spatial position. VMamba uses the same 4-stage hierarchical structure as Swin, with patch merging between stages.</p>
+
+      <figure class="diagram-figure">
+        <svg width="100%" viewBox="0 0 800 300" xmlns="http://www.w3.org/2000/svg">
+          <defs>
+            <marker id="ch18-arr7" viewBox="0 0 10 10" refX="9" refY="5"
+              markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+              <path d="M1 1L9 5L1 9" fill="none" stroke="context-stroke"
+                stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+            </marker>
+          </defs>
+
+          <text x="400" y="24" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="14" font-weight="600" fill="#1A1A18">VMamba: 2D Selective Scan — Four Scanning Directions</text>
+
+          <!-- 4×4 feature map grid -->
+          <g transform="translate(60, 50)">
+            <g fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1">
+              <rect x="0" y="0" width="40" height="40" rx="3"/>
+              <rect x="40" y="0" width="40" height="40" rx="3"/>
+              <rect x="80" y="0" width="40" height="40" rx="3"/>
+              <rect x="120" y="0" width="40" height="40" rx="3"/>
+              <rect x="0" y="40" width="40" height="40" rx="3"/>
+              <rect x="40" y="40" width="40" height="40" rx="3"/>
+              <rect x="80" y="40" width="40" height="40" rx="3"/>
+              <rect x="120" y="40" width="40" height="40" rx="3"/>
+              <rect x="0" y="80" width="40" height="40" rx="3"/>
+              <rect x="40" y="80" width="40" height="40" rx="3"/>
+              <rect x="80" y="80" width="40" height="40" rx="3"/>
+              <rect x="120" y="80" width="40" height="40" rx="3"/>
+              <rect x="0" y="120" width="40" height="40" rx="3"/>
+              <rect x="40" y="120" width="40" height="40" rx="3"/>
+              <rect x="80" y="120" width="40" height="40" rx="3"/>
+              <rect x="120" y="120" width="40" height="40" rx="3"/>
+            </g>
+            <text x="80" y="190" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="500" fill="#0F6E56">2D Feature Map</text>
+          </g>
+
+          <!-- Arrow to scanning -->
+          <line x1="230" y1="130" x2="270" y2="130" stroke="#9C9A94" stroke-width="1.5" marker-end="url(#ch18-arr7)"/>
+
+          <!-- Four scan directions -->
+          <!-- Scan 1: Left to right (purple) -->
+          <g transform="translate(290, 45)">
+            <rect x="0" y="0" width="200" height="28" rx="4" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1"/>
+            <text x="10" y="18" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="500" fill="#534AB7">→ Left-to-right raster</text>
+            <line x1="140" y1="14" x2="190" y2="14" stroke="#534AB7" stroke-width="2" marker-end="url(#ch18-arr7)"/>
+          </g>
+
+          <!-- Scan 2: Right to left (coral) -->
+          <g transform="translate(290, 85)">
+            <rect x="0" y="0" width="200" height="28" rx="4" fill="#FAECE7" stroke="#F0997B" stroke-width="1"/>
+            <text x="10" y="18" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="500" fill="#993C1D">← Right-to-left raster</text>
+            <line x1="190" y1="14" x2="140" y2="14" stroke="#993C1D" stroke-width="2" marker-end="url(#ch18-arr7)"/>
+          </g>
+
+          <!-- Scan 3: Top to bottom (amber) -->
+          <g transform="translate(290, 125)">
+            <rect x="0" y="0" width="200" height="28" rx="4" fill="#FAEEDA" stroke="#EF9F27" stroke-width="1"/>
+            <text x="10" y="18" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="500" fill="#854F0B">↓ Top-to-bottom column</text>
+            <line x1="175" y1="4" x2="175" y2="24" stroke="#854F0B" stroke-width="2" marker-end="url(#ch18-arr7)"/>
+          </g>
+
+          <!-- Scan 4: Bottom to top (blue) -->
+          <g transform="translate(290, 165)">
+            <rect x="0" y="0" width="200" height="28" rx="4" fill="#E6F1FB" stroke="#85B7EB" stroke-width="1"/>
+            <text x="10" y="18" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="500" fill="#185FA5">↑ Bottom-to-top column</text>
+            <line x1="175" y1="24" x2="175" y2="4" stroke="#185FA5" stroke-width="2" marker-end="url(#ch18-arr7)"/>
+          </g>
+
+          <!-- Merge -->
+          <line x1="500" y1="120" x2="540" y2="120" stroke="#9C9A94" stroke-width="1.5" marker-end="url(#ch18-arr7)"/>
+
+          <!-- Merge node -->
+          <rect x="545" y="86" width="70" height="68" rx="8" fill="#F1EFE8" stroke="#C8C6BE" stroke-width="1.5"/>
+          <text x="580" y="118" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#5C5B56">Σ merge</text>
+          <text x="580" y="134" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#9C9A94">(sum)</text>
+
+          <!-- Output -->
+          <line x1="615" y1="120" x2="655" y2="120" stroke="#9C9A94" stroke-width="1.5" marker-end="url(#ch18-arr7)"/>
+
+          <g transform="translate(660, 60)">
+            <g fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1">
+              <rect x="0" y="0" width="28" height="28" rx="2"/>
+              <rect x="28" y="0" width="28" height="28" rx="2"/>
+              <rect x="56" y="0" width="28" height="28" rx="2"/>
+              <rect x="84" y="0" width="28" height="28" rx="2"/>
+              <rect x="0" y="28" width="28" height="28" rx="2"/>
+              <rect x="28" y="28" width="28" height="28" rx="2"/>
+              <rect x="56" y="28" width="28" height="28" rx="2"/>
+              <rect x="84" y="28" width="28" height="28" rx="2"/>
+              <rect x="0" y="56" width="28" height="28" rx="2"/>
+              <rect x="28" y="56" width="28" height="28" rx="2"/>
+              <rect x="56" y="56" width="28" height="28" rx="2"/>
+              <rect x="84" y="56" width="28" height="28" rx="2"/>
+              <rect x="0" y="84" width="28" height="28" rx="2"/>
+              <rect x="28" y="84" width="28" height="28" rx="2"/>
+              <rect x="56" y="84" width="28" height="28" rx="2"/>
+              <rect x="84" y="84" width="28" height="28" rx="2"/>
+            </g>
+            <text x="56" y="132" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#0F6E56">Output</text>
+          </g>
+
+          <!-- Bottom annotation -->
+          <text x="400" y="270" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#9C9A94">Each direction creates a different causal ordering — summing all four ensures every token can reach every other token</text>
+        </svg>
+        <figcaption>Figure 18.7 — VMamba's four-way 2D selective scan. A 2D feature map is linearized into four 1D sequences using different scanning directions (left-to-right, right-to-left, top-to-bottom, bottom-to-top). Each is processed by Mamba's selective scan, and the four outputs are summed. This ensures full spatial connectivity despite Mamba's sequential processing.</figcaption>
+      </figure>
+
+      <h3>MambaVision: the hybrid design</h3>
+
+      <p>MambaVision (Hatamizadeh et al., NVIDIA, CVPR 2025) finds that pure Mamba struggles with long-range spatial dependencies in later stages. The fix: use Mamba blocks in the first two stages (where tokens are many and attention would be expensive) and self-attention blocks in the last two stages (where tokens are fewer and global attention is affordable). This hybrid achieves a new SOTA Pareto-front on ImageNet — better accuracy-vs-throughput than both Swin and ConvNeXt — and transfers strongly to COCO and ADE20K.</p>
+
+      <h3>MSVMamba and MAP</h3>
+
+      <p>MSVMamba (Shi et al., NeurIPS 2024) introduces hierarchy *within* the scan: some scan directions operate at original resolution while others are downsampled and then upsampled, creating multi-scale representations inside each block. MAP (Liu and Yi, CVPR 2025) addresses the pretraining question for these hybrids: it trains Mamba blocks with a global autoregressive objective and attention blocks with local MAE, combining both into a unified pretraining framework. These developments suggest that the Mamba-Transformer hybrid is not a transitional design but an emerging paradigm in its own right.</p>
+    </section>
+
+    <!-- ================================================================== -->
+    <!-- SECTION 11: PRETRAINING RESHAPES HIERARCHICAL BACKBONES            -->
+    <!-- ================================================================== -->
+    <section class="chapter-section" id="pretraining-reshapes">
+      <h2>Self-Supervised Pretraining Reshapes Hierarchical Backbones</h2>
+
+      <p>Throughout this chapter, a tension has been building: how much of a hierarchical backbone's performance comes from architectural design versus how it was pretrained? Hiera showed that removing architectural complexity while improving pretraining preserved accuracy. The models in this section push that observation to its logical extreme.</p>
+
+      <h3>DINOv3's frozen backbone dominance</h3>
+
+      <p>DINOv3 (Meta, 2025) scales self-supervised ViT pretraining to 7 billion parameters and 1.7 billion training images. Its key technical contribution is **Gram anchoring**: a regularization technique that prevents dense feature quality from degrading during extended training — a long-standing problem where longer training improved classification features but hurt dense prediction features. With Gram anchoring, DINOv3's representations improve monotonically for both tasks.</p>
+
+      <p>The striking result: a DINOv3 ViT-g backbone, *frozen* with a simple linear head, outperforms *fine-tuned* Swin-L and Hiera-L on ADE20K semantic segmentation and matches them on COCO object detection. No hierarchical architecture, no multi-scale features, no FPN — just a massive plain ViT with the right pretraining. This is the strongest evidence yet that architectural hierarchy may be a proxy for what pretraining at sufficient scale provides for free.</p>
+
+      <figure class="diagram-figure">
+        <svg width="100%" viewBox="0 0 800 280" xmlns="http://www.w3.org/2000/svg">
+          <text x="400" y="24" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="14" font-weight="600" fill="#1A1A18">Dense Prediction: Frozen Plain ViT vs Fine-Tuned Hierarchical</text>
+
+          <!-- Legend -->
+          <rect x="200" y="40" width="14" height="14" rx="2" fill="#534AB7"/>
+          <text x="220" y="52" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#5C5B56">Swin-L (fine-tuned)</text>
+          <rect x="350" y="40" width="14" height="14" rx="2" fill="#854F0B"/>
+          <text x="370" y="52" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#5C5B56">Hiera-L (fine-tuned)</text>
+          <rect x="510" y="40" width="14" height="14" rx="2" fill="#0F6E56"/>
+          <text x="530" y="52" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#5C5B56">DINOv3 ViT-g (frozen)</text>
+
+          <!-- ADE20K mIoU -->
+          <text x="200" y="90" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="600" fill="#1A1A18">ADE20K mIoU</text>
+
+          <!-- Swin-L bar -->
+          <rect x="115" y="100" width="120" height="24" rx="4" fill="#534AB7"/>
+          <text x="125" y="116" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#FFFFFF">53.5</text>
+          <!-- Hiera-L bar -->
+          <rect x="115" y="128" width="128" height="24" rx="4" fill="#854F0B"/>
+          <text x="125" y="144" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#FFFFFF">54.6</text>
+          <!-- DINOv3 bar -->
+          <rect x="115" y="156" width="140" height="24" rx="4" fill="#0F6E56"/>
+          <text x="125" y="172" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#FFFFFF">56.2 (frozen!)</text>
+
+          <!-- COCO box AP -->
+          <text x="470" y="90" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="600" fill="#1A1A18">COCO box AP</text>
+
+          <!-- Swin-L bar -->
+          <rect x="385" y="100" width="125" height="24" rx="4" fill="#534AB7"/>
+          <text x="395" y="116" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#FFFFFF">58.7</text>
+          <!-- Hiera-L bar -->
+          <rect x="385" y="128" width="128" height="24" rx="4" fill="#854F0B"/>
+          <text x="395" y="144" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#FFFFFF">59.1</text>
+          <!-- DINOv3 bar -->
+          <rect x="385" y="156" width="131" height="24" rx="4" fill="#0F6E56"/>
+          <text x="395" y="172" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#FFFFFF">59.3 (frozen!)</text>
+
+          <!-- ImageNet top-1 -->
+          <text x="690" y="90" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="600" fill="#1A1A18">ImageNet Top-1</text>
+
+          <!-- Swin-L bar -->
+          <rect x="620" y="100" width="110" height="24" rx="4" fill="#534AB7"/>
+          <text x="630" y="116" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#FFFFFF">87.3</text>
+          <!-- Hiera-L bar -->
+          <rect x="620" y="128" width="112" height="24" rx="4" fill="#854F0B"/>
+          <text x="630" y="144" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#FFFFFF">87.8</text>
+          <!-- DINOv3 bar -->
+          <rect x="620" y="156" width="120" height="24" rx="4" fill="#0F6E56"/>
+          <text x="630" y="172" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#FFFFFF">89.5 (frozen!)</text>
+
+          <!-- Annotation -->
+          <text x="400" y="210" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="500" fill="#0F6E56">A frozen plain ViT with the right pretraining matches or beats</text>
+          <text x="400" y="228" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="500" fill="#0F6E56">fine-tuned hierarchical models on dense prediction tasks</text>
+
+          <text x="400" y="258" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#9C9A94">Numbers are illustrative of the relative ordering; see DINOv3 paper for exact benchmarks</text>
+        </svg>
+        <figcaption>Figure 18.8 — Performance comparison across three benchmarks. DINOv3 (plain ViT-g, frozen with linear head) matches or exceeds fine-tuned Swin-L and Hiera-L on dense prediction tasks (ADE20K, COCO) that were historically the raison d'être of hierarchical architectures. Numbers are illustrative of the relative ordering reported in the DINOv3 paper.</figcaption>
+      </figure>
+
+      <h3>InternViT-6B: dynamic tiling at scale</h3>
+
+      <p>InternViT-6B (Chen et al., OpenGVLab) takes a different approach to multi-scale features from a plain ViT: **dynamic tiling**. A high-resolution image is split into tiles of ViT-compatible size (e.g., 448×448), each tile is processed independently through the ViT encoder, and the tile-level features are reassembled into a spatial feature map. By varying the tile grid (e.g., 2×2, 3×3, 4×4), the model produces features at multiple effective resolutions without any architectural change. InternViT-6B uses this approach to serve as the vision encoder for the InternVL multimodal LLM family, demonstrating that dynamic tiling is a viable alternative to architectural hierarchy.</p>
+
+      <p>The following code shows the core dynamic tiling mechanism.</p>
+
+<pre><code class="language-python">
+import torch
+import torch.nn as nn
+
+def dynamic_tile_encode(
+    image: torch.Tensor,      # (1, 3, H, W) — high-resolution input
+    encoder: nn.Module,        # frozen ViT encoder
+    tile_size: int = 448,      # ViT-compatible tile size
+    patch_size: int = 14,      # ViT patch size
+) -> torch.Tensor:
+    """Split high-res image into tiles, encode each, reassemble."""
+    _, C, H, W = image.shape
+    nH, nW = H // tile_size, W // tile_size
+    # Split into tiles: (1, 3, nH, tile, nW, tile) → (nH*nW, 3, tile, tile)
+    tiles = image.view(1, C, nH, tile_size, nW, tile_size)
+    tiles = tiles.permute(0, 2, 4, 1, 3, 5).reshape(nH * nW, C, tile_size, tile_size)
+    # Encode each tile through ViT
+    with torch.no_grad():
+        features = encoder(tiles)  # (nH*nW, grid^2, d_model)
+    grid = tile_size // patch_size  # tokens per tile side (e.g., 32)
+    d = features.shape[-1]
+    # Reassemble into spatial feature map
+    features = features.view(nH, nW, grid, grid, d)
+    features = features.permute(0, 2, 1, 3, 4)  # (nH, grid, nW, grid, d)
+    features = features.reshape(1, nH * grid, nW * grid, d)
+    return features  # (1, nH*grid, nW*grid, d_model) — full spatial map
+
+# Example: 1344×1344 image → 3×3 tiles of 448×448
+# Each tile → 32×32 tokens → reassembled to 96×96 spatial feature map
+</code></pre>
+
+      <h3>SigLIP 2: multi-objective pretraining</h3>
+
+      <p>SigLIP 2 (Google, 2025) extends the original SigLIP's sigmoid contrastive loss with three additional training objectives: captioning (predicting text descriptions), self-distillation (using an EMA teacher), and masked prediction (reconstructing masked patches). The result is a vision encoder that produces representations rivaling dedicated hierarchical backbones on dense prediction tasks while also excelling at zero-shot classification and retrieval. SigLIP 2 reinforces the lesson: when the pretraining recipe is rich enough, a plain ViT backbone can serve all tasks without architectural specialization.</p>
+    </section>
+
+    <!-- ================================================================== -->
+    <!-- SECTION 12: THE LANDSCAPE IN 2026                                  -->
+    <!-- ================================================================== -->
+    <section class="chapter-section" id="landscape-2026">
+      <h2>The Landscape in 2026</h2>
+
+      <h3>Three competing paradigms</h3>
+
+      <p>The field has settled into three coexisting approaches to multi-scale vision features. The **Swin family** (window attention with architectural hierarchy) remains widely deployed, particularly in application domains like medical imaging and remote sensing where practitioners want a proven backbone. The **simplified plain ViT** approach (Hiera, DINOv3) dominates when large-scale pretraining is available and deployment speed matters. The **SSM hybrid** approach (MambaVision, VMamba) offers the best accuracy-vs-throughput tradeoffs on current hardware but requires more specialized kernels and has a smaller ecosystem of downstream adaptations.</p>
+
+      <p>Swin and PVT have not released v3 versions. Their core innovations — window attention, spatial reduction, hierarchical stages — have been absorbed into the vocabulary of the field. These are no longer specific architectures but general design patterns available to any new backbone.</p>
+
+      <h3>The pretraining-vs-architecture tension</h3>
+
+      <p>The deepest story in this chapter is not any single architecture but the evolving relationship between architecture and pretraining. In 2021, Swin showed that clever architectural engineering (shifted windows, relative position bias) could make a hierarchical ViT outperform CNNs on dense prediction. In 2023, Hiera showed that half that engineering was unnecessary if you used MAE pretraining. In 2025, DINOv3 showed that *all* of it might be unnecessary at sufficient pretraining scale. The progression suggests a general principle: architectural inductive biases are most valuable when data and compute are limited. As pretraining scales up, the model learns the biases that the architecture previously had to impose.</p>
+
+      <h3>Open questions</h3>
+
+      <p>Will dynamic tiling (as in InternViT) fully replace static hierarchical stages? Can linear attention or SSMs completely replace softmax attention in vision backbones, or will the hybrid approach persist? How far can pretraining-first approaches go before some form of architectural multi-scale structure becomes necessary again — and at what compute regime does that crossover occur? The answers will shape the next generation of vision backbones. What is already clear is that the most successful designs will co-evolve their architecture and pretraining strategy rather than optimizing either in isolation.</p>
+
+      <div class="callout callout-insight">
+        <div class="callout-title">Key Insight</div>
+        <p>The deepest lesson of the hierarchical ViT story is that architecture and pretraining are not independent variables. Swin's shifted windows were necessary under supervised pretraining. Hiera's simplifications became possible because of MAE. DINOv3 makes even Hiera's remaining architectural choices look unnecessary. The frontier is not a specific architecture but the co-design of architecture and training objective — and that co-design space is still largely unexplored.</p>
+      </div>
+
+      <p>In the next chapter, we turn from backbones to heads: the detection and segmentation architectures — DETR, SAM, Mask2Former — that consume the multi-scale features these hierarchical backbones produce.</p>
+    </section>
+
+  </article>
+
+  <footer class="chapter-footer">
+    <div class="footer-nav">
+      <a href="ch17.html">← Previous: Vision Transformer (ViT)</a>
+      <a href="ch19.html">Next: Transformers for Detection and Segmentation →</a>
+    </div>
+  </footer>
+
+</body>
+</html>

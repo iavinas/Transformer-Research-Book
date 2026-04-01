@@ -726,6 +726,7 @@ through dense prediction, video understanding, and video generation.*
 - Single-scale features: ViT produces one resolution of features, problematic for detection
 - High resolution is expensive: 14x14 patches at high resolution = O(n^2) attention cost
 - Multi-scale feature maps: why FPN-style hierarchies are needed for detection/segmentation
+- The design space: how to build hierarchical multi-scale features into a transformer
 
 **Swin Transformer (Liu et al., 2021)**
 - Shifted window attention: restrict attention to local windows, shift between layers
@@ -738,7 +739,7 @@ through dense prediction, video understanding, and video generation.*
 - Scaling to 3B parameters: post-norm, scaled cosine attention, log-spaced continuous PE
 - Res-Post-Norm: combined post-norm stability with residual connections
 - Training on 192x192 then fine-tuning on 1536x1536: window size adaptation
-- State-of-the-art across ADE20K, COCO, ImageNet at time of release
+- Flash Window Attention (Zhang, 2025): IO-aware kernel for window attention, 3x speedup over FlashAttention for short-sequence windowed workloads
 
 **PVT (Pyramid Vision Transformer)**
 - Spatial-reduction attention: downsample K and V in deeper stages
@@ -749,6 +750,54 @@ through dense prediction, video understanding, and video generation.*
 - Masked image modeling: predict discrete visual tokens (dVAE from DALL-E)
 - Self-supervised ViT training analogous to BERT
 - BEiT v2: vector-quantized visual tokenizer, richer targets
+- BEiT-3: image as a foreign language — unified multimodal pretraining (no BEiT-4; line plateaued)
+
+**Hiera: Simplicity wins (Ryali et al., Meta ICML 2023)**
+- Strip all bells and whistles: no relative position bias, no shifted windows
+- Plain ViT blocks with local attention (early stages) and global attention (later stages)
+- MAE pretraining recovers accuracy lost from architectural simplification
+- 2.4x faster than MViTv2 on images, 5.1x faster on video
+- Adopted as vision encoder in SAM 2: real-world validation at massive scale
+
+**FasterViT and efficient hierarchical designs (NVIDIA, ICLR 2024)**
+- Hierarchical Attention (HAT): carrier tokens for global context within local windows
+- Each window has dedicated tokens that participate in both local and global attention
+- Near-linear complexity with image resolution; SOTA Pareto-front (accuracy vs throughput)
+- EfficientViT (MIT Han Lab): multi-scale linear attention, 8.8x latency reduction over SegFormer
+- FastViT (Apple): structural reparameterization (RepMixer) for mobile deployment
+- TransNeXt (CVPR 2024): biomimetic aggregated attention simulating foveal vision
+
+**Linear attention revival for hierarchical ViTs**
+- L2ViT (Zheng et al., 2025): local concentration module fixes linear attention's distribution collapse
+- Alternating enhanced linear global attention with local window attention
+- 84.4% ImageNet-1K Top-1 (87.0% with ImageNet-22K pretraining at 384 resolution)
+- The question: can linear attention replace softmax in hierarchical backbones?
+
+**Attention-free hierarchical backbones**
+- FocalNet (Yang et al., NeurIPS 2022): focal modulation replaces self-attention entirely
+- Depth-wise convolutions + gated aggregation + element-wise modulation; outperforms Swin
+- Vision KAN (2026): Kolmogorov-Arnold Networks in a 4-stage hierarchical backbone
+- The pattern: hierarchical multi-stage design transcends the attention mechanism itself
+
+**Mamba-Transformer hybrids: the SSM challenge (2024-2025)**
+- VMamba (NeurIPS 2024): 2D Selective Scan (SS2D) with four-way scanning for vision
+- MambaVision (NVIDIA, CVPR 2025): Mamba early stages + attention late stages; SOTA Pareto-front
+- MSVMamba (NeurIPS 2024): multi-scale scanning — hierarchy within the scan itself
+- MAP (CVPR 2025): masked autoregressive pretraining for hybrid Mamba-Transformer backbones
+- Brief treatment here; full SSM coverage in Part VIII (Post-Transformer Architectures)
+
+**Self-supervised pretraining reshapes hierarchical backbones**
+- DINOv3 (Meta, 2025): 7B parameters, 1.7B images, Gram anchoring for dense feature stability
+- Frozen DINOv3 backbone outperforms fine-tuned hierarchical models on dense prediction
+- The emerging insight: pretraining recipe matters as much as architectural complexity
+- InternViT-6B (OpenGVLab): hierarchical ViT scaled to 6B for multimodal LLMs via dynamic tiling
+- SigLIP 2 (Google, 2025): sigmoid contrastive + captioning + self-distillation + masked prediction
+
+**The landscape in 2026: convergence and open questions**
+- Swin/PVT lines plateaued (no v3 releases); ideas absorbed into newer architectures
+- Three competing paradigms: window attention (Swin-family), simplified plain ViT (Hiera), SSM hybrids (MambaVision)
+- The pretraining-vs-architecture tension: DINOv3 shows frozen simple backbones rival complex ones
+- Open question: will hierarchical structure be designed into the architecture or emerge from pretraining?
 
 ---
 
