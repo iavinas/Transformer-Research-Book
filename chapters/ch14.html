@@ -1,0 +1,1284 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Chapter 14: Training Language Models at Scale — Transformer Research Book</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <link rel="stylesheet" href="../assets/math.css">
+  <link rel="stylesheet" href="../assets/prism.css">
+  <!-- KaTeX for math rendering -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left: '$$', right: '$$', display: true},
+        {left: '$', right: '$', display: false}
+      ]
+    })">
+  </script>
+  <!-- Prism for code blocks -->
+  <script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/prism.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-python.min.js"></script>
+</head>
+<body>
+  <nav class="chapter-nav">
+    <a href="../index.html" class="nav-home">← Table of Contents</a>
+    <span class="nav-chapter">Chapter 14</span>
+    <div style="display:flex; align-items:center; gap:1rem;">
+      <button class="theme-toggle" onclick="toggleTheme()" aria-label="Toggle dark mode">
+        <span class="icon-moon">&#9789;</span><span class="icon-sun">&#9788;</span>
+      </button>
+      <a href="ch15.html" class="nav-next">Next Chapter →</a>
+    </div>
+  </nav>
+  <script>
+    function toggleTheme() {
+      document.documentElement.classList.toggle('dark');
+      localStorage.setItem('theme', document.documentElement.classList.contains('dark') ? 'dark' : 'light');
+    }
+    if (localStorage.getItem('theme') === 'dark') document.documentElement.classList.add('dark');
+  </script>
+
+  <article class="chapter">
+
+    <header class="chapter-header">
+      <div class="chapter-number">Chapter 14</div>
+      <h1 class="chapter-title">Training Language Models at Scale</h1>
+      <p class="chapter-lead">Training GPT-3's 175 billion parameters requires roughly $3.14 \times 10^{23}$ floating-point operations. A single A100 GPU delivering 312 TFLOPS would need over 36 years. The actual training took 34 days on 1,024 GPUs — and the harder problem was not speed but fit: 175B parameters in mixed-precision Adam consume over 2.8 terabytes of memory, far beyond any single device. Every technique in this chapter attacks one or both of these constraints — fitting the model across devices and keeping those devices busy. By the end, you will understand how BLOOM, LLaMA, and DeepSeek V3 were actually trained, from the ring all-reduce that synchronizes gradients to the 3D parallelism grid that maps a trillion-parameter model onto thousands of GPUs.</p>
+    </header>
+
+    <!-- ============================================================ -->
+    <!-- SECTION 1: DATA PARALLELISM                                  -->
+    <!-- ============================================================ -->
+    <section class="chapter-section" id="data-parallelism">
+      <h2>Data Parallelism</h2>
+
+      <p>The simplest way to use multiple GPUs is to give each one a copy of the entire model and a different slice of the training data. Each GPU computes gradients on its own mini-batch, then the gradients are averaged across all GPUs so every copy stays in sync. This is <strong>data parallelism</strong>, and it remains the foundation of every large-scale training system.</p>
+
+      <h3>Naive Data Parallelism and All-Reduce</h3>
+
+      <p>In naive data parallelism, $N$ GPUs each hold a full replica of the model with parameters $\theta$. Each GPU runs a forward and backward pass on its local mini-batch, producing local gradients $g_i$. To ensure every replica updates identically, the gradients must be globally averaged: $\bar{g} = \frac{1}{N}\sum_{i=1}^{N} g_i$. The operation that computes this sum and distributes the result to every GPU is called <strong>all-reduce</strong>.</p>
+
+      <p>The bandwidth-optimal algorithm for all-reduce is <strong>ring all-reduce</strong>. It arranges the $N$ GPUs in a logical ring and proceeds in two phases: reduce-scatter (each GPU accumulates partial sums) followed by all-gather (each GPU broadcasts its completed chunk). The total data transferred per GPU is:</p>
+
+      <div class="math-block">
+        $$V_{\text{allreduce}} = \frac{2(N-1)}{N} \cdot |\theta|$$
+      </div>
+
+      <p>where $|\theta|$ is the total parameter count (all-reduce volume, measured in elements). For large $N$, this approaches $2|\theta|$ — the volume is essentially independent of the number of GPUs. This is what makes ring all-reduce scalable: adding more GPUs does not increase the per-GPU communication burden.</p>
+
+      <figure class="diagram-figure">
+        <svg width="100%" viewBox="0 0 800 340" xmlns="http://www.w3.org/2000/svg">
+          <defs>
+            <marker id="ch14-arr" viewBox="0 0 10 10" refX="9" refY="5"
+              markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+              <path d="M1 1L9 5L1 9" fill="none" stroke="context-stroke"
+                stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+            </marker>
+          </defs>
+
+          <!-- Title -->
+          <text x="400" y="24" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="13" font-weight="600" fill="#1A1A18">Ring All-Reduce: Reduce-Scatter → All-Gather</text>
+
+          <!-- Phase 1: Reduce-Scatter -->
+          <text x="200" y="56" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="500" fill="#534AB7">Phase 1: Reduce-Scatter</text>
+
+          <!-- 4 GPU boxes in a ring - left side -->
+          <rect x="140" y="80" width="120" height="44" rx="6" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1.5"/>
+          <text x="200" y="100" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="13" font-weight="500" fill="#534AB7">GPU 0</text>
+          <text x="200" y="116" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#9C9A94">g₀ₐ + g₁ₐ + g₂ₐ + g₃ₐ</text>
+
+          <rect x="280" y="150" width="120" height="44" rx="6" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1.5"/>
+          <text x="340" y="170" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="13" font-weight="500" fill="#534AB7">GPU 1</text>
+          <text x="340" y="186" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#9C9A94">chunk B summed</text>
+
+          <rect x="140" y="220" width="120" height="44" rx="6" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1.5"/>
+          <text x="200" y="240" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="13" font-weight="500" fill="#534AB7">GPU 2</text>
+          <text x="200" y="256" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#9C9A94">chunk C summed</text>
+
+          <rect x="20" y="150" width="120" height="44" rx="6" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1.5"/>
+          <text x="80" y="170" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="13" font-weight="500" fill="#534AB7">GPU 3</text>
+          <text x="80" y="186" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#9C9A94">chunk D summed</text>
+
+          <!-- Ring arrows - reduce-scatter -->
+          <path d="M260 100 Q290 100 290 145" fill="none" stroke="#854F0B" stroke-width="1.5" marker-end="url(#ch14-arr)"/>
+          <path d="M310 194 Q290 220 265 230" fill="none" stroke="#854F0B" stroke-width="1.5" marker-end="url(#ch14-arr)"/>
+          <path d="M140 240 Q110 240 110 198" fill="none" stroke="#854F0B" stroke-width="1.5" marker-end="url(#ch14-arr)"/>
+          <path d="M110 150 Q120 120 140 108" fill="none" stroke="#854F0B" stroke-width="1.5" marker-end="url(#ch14-arr)"/>
+
+          <text x="200" y="300" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#9C9A94">N−1 = 3 steps, each GPU holds 1 fully-reduced chunk</text>
+
+          <!-- Phase 2: All-Gather -->
+          <text x="600" y="56" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="500" fill="#0F6E56">Phase 2: All-Gather</text>
+
+          <!-- 4 GPU boxes in a ring - right side -->
+          <rect x="540" y="80" width="120" height="44" rx="6" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1.5"/>
+          <text x="600" y="100" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="13" font-weight="500" fill="#0F6E56">GPU 0</text>
+          <text x="600" y="116" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#9C9A94">A B C D (complete)</text>
+
+          <rect x="680" y="150" width="120" height="44" rx="6" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1.5"/>
+          <text x="740" y="170" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="13" font-weight="500" fill="#0F6E56">GPU 1</text>
+          <text x="740" y="186" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#9C9A94">A B C D (complete)</text>
+
+          <rect x="540" y="220" width="120" height="44" rx="6" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1.5"/>
+          <text x="600" y="240" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="13" font-weight="500" fill="#0F6E56">GPU 2</text>
+          <text x="600" y="256" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#9C9A94">A B C D (complete)</text>
+
+          <rect x="420" y="150" width="120" height="44" rx="6" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1.5"/>
+          <text x="480" y="170" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="13" font-weight="500" fill="#0F6E56">GPU 3</text>
+          <text x="480" y="186" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#9C9A94">A B C D (complete)</text>
+
+          <!-- Ring arrows - all-gather -->
+          <path d="M660 100 Q690 100 690 145" fill="none" stroke="#0F6E56" stroke-width="1.5" marker-end="url(#ch14-arr)"/>
+          <path d="M710 194 Q690 220 665 230" fill="none" stroke="#0F6E56" stroke-width="1.5" marker-end="url(#ch14-arr)"/>
+          <path d="M540 240 Q510 240 510 198" fill="none" stroke="#0F6E56" stroke-width="1.5" marker-end="url(#ch14-arr)"/>
+          <path d="M510 150 Q520 120 540 108" fill="none" stroke="#0F6E56" stroke-width="1.5" marker-end="url(#ch14-arr)"/>
+
+          <text x="600" y="300" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#9C9A94">N−1 = 3 more steps, every GPU has full result</text>
+
+          <!-- Total -->
+          <text x="400" y="330" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="500" fill="#5C5B56">Total: 2(N−1) = 6 steps · each GPU transfers 2(N−1)/N · |θ| elements</text>
+        </svg>
+        <figcaption>Figure 14.1 — Ring all-reduce on 4 GPUs. Left: reduce-scatter phase — after 3 steps, each GPU holds one fully-summed chunk (A, B, C, or D). Right: all-gather phase — after 3 more steps, every GPU holds the complete globally-reduced gradient. Total per-GPU transfer approaches 2|θ| regardless of GPU count.</figcaption>
+      </figure>
+
+      <h3>DDP: Overlapping Communication with Computation</h3>
+
+      <p>Naive data parallelism waits for the backward pass to finish, then runs all-reduce, then runs the optimizer step. PyTorch's <strong>Distributed Data Parallel</strong> (DDP) eliminates this serialization by overlapping communication with computation. DDP groups parameters into buckets and triggers the all-reduce for each bucket as soon as its gradients are ready — while earlier layers are still computing their gradients. Since the backward pass proceeds from the last layer to the first, the final-layer gradients are ready first and can be communicated immediately.</p>
+
+      <figure class="diagram-figure">
+        <svg width="100%" viewBox="0 0 800 260" xmlns="http://www.w3.org/2000/svg">
+          <defs>
+            <marker id="ch14-arr2" viewBox="0 0 10 10" refX="9" refY="5"
+              markerWidth="5" markerHeight="5" orient="auto-start-reverse">
+              <path d="M1 1L9 5L1 9" fill="none" stroke="context-stroke"
+                stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+            </marker>
+          </defs>
+
+          <!-- Labels -->
+          <text x="50" y="40" text-anchor="end" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="500" fill="#993C1D">Naive DP</text>
+          <text x="50" y="150" text-anchor="end" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="500" fill="#0F6E56">DDP</text>
+
+          <!-- Naive DP timeline -->
+          <rect x="70" y="24" width="200" height="32" rx="4" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1"/>
+          <text x="170" y="44" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#534AB7">Forward</text>
+
+          <rect x="275" y="24" width="200" height="32" rx="4" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1"/>
+          <text x="375" y="44" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#534AB7">Backward</text>
+
+          <rect x="480" y="24" width="160" height="32" rx="4" fill="#FAEEDA" stroke="#EF9F27" stroke-width="1"/>
+          <text x="560" y="44" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#854F0B">All-Reduce</text>
+
+          <rect x="645" y="24" width="80" height="32" rx="4" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1"/>
+          <text x="685" y="44" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#0F6E56">Update</text>
+
+          <!-- Time arrow for naive -->
+          <line x1="70" y1="70" x2="730" y2="70" stroke="#C8C6BE" stroke-width="1" marker-end="url(#ch14-arr2)"/>
+          <text x="740" y="74" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#9C9A94">time</text>
+
+          <!-- Naive total bracket -->
+          <line x1="70" y1="80" x2="725" y2="80" stroke="#993C1D" stroke-width="1.5"/>
+          <text x="400" y="96" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#993C1D">Total step time: T_compute + T_comm</text>
+
+          <!-- DDP timeline -->
+          <rect x="70" y="134" width="200" height="32" rx="4" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1"/>
+          <text x="170" y="154" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#534AB7">Forward</text>
+
+          <!-- Backward split into buckets -->
+          <rect x="275" y="134" width="66" height="32" rx="4" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1"/>
+          <text x="308" y="154" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#534AB7">Bwd 3</text>
+
+          <rect x="345" y="134" width="66" height="32" rx="4" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1"/>
+          <text x="378" y="154" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#534AB7">Bwd 2</text>
+
+          <rect x="415" y="134" width="66" height="32" rx="4" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1"/>
+          <text x="448" y="154" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#534AB7">Bwd 1</text>
+
+          <!-- Overlapped all-reduce buckets -->
+          <rect x="345" y="172" width="66" height="24" rx="4" fill="#FAEEDA" stroke="#EF9F27" stroke-width="1"/>
+          <text x="378" y="188" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#854F0B">AR 3</text>
+
+          <rect x="415" y="172" width="66" height="24" rx="4" fill="#FAEEDA" stroke="#EF9F27" stroke-width="1"/>
+          <text x="448" y="188" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#854F0B">AR 2</text>
+
+          <rect x="485" y="172" width="66" height="24" rx="4" fill="#FAEEDA" stroke="#EF9F27" stroke-width="1"/>
+          <text x="518" y="188" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#854F0B">AR 1</text>
+
+          <rect x="555" y="134" width="80" height="32" rx="4" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1"/>
+          <text x="595" y="154" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#0F6E56">Update</text>
+
+          <!-- DDP total bracket -->
+          <line x1="70" y1="210" x2="635" y2="210" stroke="#0F6E56" stroke-width="1.5"/>
+          <text x="350" y="226" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#0F6E56">Total step time: T_compute + overlap residual</text>
+
+          <!-- Savings annotation -->
+          <line x1="640" y1="80" x2="640" y2="210" stroke="#993C1D" stroke-width="1" stroke-dasharray="4 3"/>
+          <text x="690" y="148" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#993C1D">saved</text>
+        </svg>
+        <figcaption>Figure 14.2 — Naive data parallelism (top) serializes the backward pass and all-reduce. DDP (bottom) splits parameters into buckets and overlaps each bucket's all-reduce with the backward pass of earlier layers. The communication is almost entirely hidden behind compute.</figcaption>
+      </figure>
+
+      <h3>Gradient Accumulation as Communication Reduction</h3>
+
+      <p>Chapter 6 introduced gradient accumulation as a way to simulate larger batch sizes on a single GPU. In the distributed setting, it serves a second purpose: reducing communication. If each GPU accumulates gradients over $K$ micro-batches before triggering the all-reduce, the communication frequency drops by $K\times$ while the effective global batch size becomes $K \cdot N \cdot B_{\text{micro}}$. BLOOM's training used $K = 2$ gradient accumulation steps across 384 GPUs, yielding a global batch size of 2,048 sequences.</p>
+
+      <h3>Batch Size Scaling</h3>
+
+      <p>Larger global batch sizes enable faster training (more tokens per step) but require careful learning rate adjustment. The <strong>linear scaling rule</strong> says: if you multiply the batch size by $k$, multiply the learning rate by $k$. The <strong>square root rule</strong>, more conservative, scales the learning rate by $\sqrt{k}$. Both require a warm-up period — the first few hundred steps use a lower learning rate to avoid early instability. LLaMA 3 405B used a global batch size of 4M tokens across 16,384 GPUs with a gradual ramp from 8M to 16M tokens during the first phase of training.</p>
+
+      <p>The following shows a minimal DDP training loop with gradient accumulation.</p>
+
+<pre><code class="language-python">
+import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
+
+def train_ddp(rank, world_size, model, dataset, accum_steps=4):
+    dist.init_process_group("nccl", rank=rank, world_size=world_size)
+    model = model.to(rank)
+    model = DDP(model, device_ids=[rank])  # wrap model for gradient sync
+    sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank)
+    loader = torch.utils.data.DataLoader(dataset, batch_size=8, sampler=sampler)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+
+    for epoch in range(num_epochs):
+        sampler.set_epoch(epoch)  # shuffle differently each epoch
+        for step, batch in enumerate(loader):
+            input_ids = batch["input_ids"].to(rank)        # (B, seq_len)
+            labels = batch["labels"].to(rank)               # (B, seq_len)
+
+            with model.no_sync() if (step + 1) % accum_steps != 0 else nullcontext():
+                loss = model(input_ids, labels=labels).loss  # forward + backward
+                (loss / accum_steps).backward()              # scale gradient
+
+            if (step + 1) % accum_steps == 0:
+                # all-reduce happens here automatically via DDP
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+                optimizer.zero_grad()
+</code></pre>
+
+    </section>
+
+    <!-- ============================================================ -->
+    <!-- SECTION 2: MODEL PARALLELISM                                 -->
+    <!-- ============================================================ -->
+    <section class="chapter-section" id="model-parallelism">
+      <h2>Model Parallelism</h2>
+
+      <p>Data parallelism requires every GPU to hold a full copy of the model. A 70B parameter model in BF16 consumes 140GB just for the weights — already exceeding the 80GB of an A100. When the model does not fit on one device, we must split the model itself across GPUs. There are two orthogonal strategies: <strong>tensor parallelism</strong> (split within a layer) and <strong>pipeline parallelism</strong> (split across layers).</p>
+
+      <h3>Tensor Parallelism: Megatron-LM</h3>
+
+      <p>Tensor parallelism, introduced in Megatron-LM (Shoeybi et al., 2019), splits individual weight matrices across GPUs. The key insight is that the two linear layers in the MLP — and the QKV projections in attention — can be partitioned so that most computation happens independently, with a single all-reduce synchronizing the result.</p>
+
+      <p>Consider a linear layer $Y = XW$ (matrix multiply, $\mathbb{R}^{b \times d} \times \mathbb{R}^{d \times d} \to \mathbb{R}^{b \times d}$). We can split $W$ in two ways:</p>
+
+      <p><strong>Column-parallel:</strong> Split $W$ along the output dimension into $t$ slices: $W = [W_1 | W_2 | \ldots | W_t]$, where each $W_i \in \mathbb{R}^{d \times d/t}$. Each GPU $i$ computes $Y_i = XW_i$ independently. The outputs $Y_i$ are different columns of the full result — no communication is needed if the next operation (like GeLU) applies element-wise.</p>
+
+      <p><strong>Row-parallel:</strong> Split $W$ along the input dimension: $W = [W_1; W_2; \ldots; W_t]^\top$, where each $W_i \in \mathbb{R}^{d/t \times d}$. Each GPU computes $Y_i = X_i W_i$ on its local slice of the input, producing a partial sum. An all-reduce sums these partial results to get the final output $Y = \sum_i Y_i$ (all-reduce, all GPUs receive $Y \in \mathbb{R}^{b \times d}$).</p>
+
+      <figure class="diagram-figure">
+        <svg width="100%" viewBox="0 0 800 380" xmlns="http://www.w3.org/2000/svg">
+          <defs>
+            <marker id="ch14-arr3" viewBox="0 0 10 10" refX="9" refY="5"
+              markerWidth="5" markerHeight="5" orient="auto-start-reverse">
+              <path d="M1 1L9 5L1 9" fill="none" stroke="context-stroke"
+                stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+            </marker>
+          </defs>
+
+          <!-- Column-Parallel Panel -->
+          <rect x="20" y="16" width="360" height="30" rx="5" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1"/>
+          <text x="200" y="36" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="600" fill="#534AB7">Column-Parallel Linear</text>
+
+          <!-- Input X (replicated) -->
+          <rect x="40" y="70" width="60" height="80" rx="4" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1.5"/>
+          <text x="70" y="115" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="13" font-weight="500" fill="#0F6E56">X</text>
+          <text x="70" y="60" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#9C9A94">b × d</text>
+
+          <!-- W split column-wise -->
+          <rect x="130" y="70" width="40" height="80" rx="4" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1.5"/>
+          <text x="150" y="115" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#534AB7">W₁</text>
+
+          <rect x="175" y="70" width="40" height="80" rx="4" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1.5"/>
+          <text x="195" y="115" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#534AB7">W₂</text>
+
+          <text x="170" y="60" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#9C9A94">d × d/t each</text>
+
+          <!-- Arrow -->
+          <line x1="220" y1="110" x2="250" y2="110" stroke="#9C9A94" stroke-width="1.5" marker-end="url(#ch14-arr3)"/>
+
+          <!-- Output Y columns -->
+          <rect x="260" y="70" width="40" height="80" rx="4" fill="#FAECE7" stroke="#F0997B" stroke-width="1.5"/>
+          <text x="280" y="115" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#993C1D">Y₁</text>
+
+          <rect x="305" y="70" width="40" height="80" rx="4" fill="#FAECE7" stroke="#F0997B" stroke-width="1.5"/>
+          <text x="325" y="115" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#993C1D">Y₂</text>
+
+          <text x="300" y="60" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#9C9A94">b × d/t each</text>
+
+          <text x="200" y="175" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#0F6E56">No sync needed → GeLU applied independently</text>
+
+          <!-- Vertical divider -->
+          <line x1="400" y1="10" x2="400" y2="370" stroke="#E5E3DC" stroke-width="1" stroke-dasharray="5 4"/>
+
+          <!-- Row-Parallel Panel -->
+          <rect x="420" y="16" width="360" height="30" rx="5" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1"/>
+          <text x="600" y="36" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="600" fill="#534AB7">Row-Parallel Linear</text>
+
+          <!-- Input X split row-wise -->
+          <rect x="440" y="70" width="60" height="38" rx="4" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1.5"/>
+          <text x="470" y="93" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#0F6E56">X₁</text>
+
+          <rect x="440" y="112" width="60" height="38" rx="4" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1.5"/>
+          <text x="470" y="135" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#0F6E56">X₂</text>
+
+          <text x="470" y="60" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#9C9A94">b × d/t</text>
+
+          <!-- W split row-wise -->
+          <rect x="530" y="70" width="60" height="38" rx="4" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1.5"/>
+          <text x="560" y="93" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#534AB7">W₁</text>
+
+          <rect x="530" y="112" width="60" height="38" rx="4" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1.5"/>
+          <text x="560" y="135" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#534AB7">W₂</text>
+
+          <text x="560" y="60" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#9C9A94">d/t × d</text>
+
+          <!-- Arrow to partial sums -->
+          <line x1="595" y1="110" x2="625" y2="110" stroke="#9C9A94" stroke-width="1.5" marker-end="url(#ch14-arr3)"/>
+
+          <!-- Partial sums + all-reduce -->
+          <rect x="635" y="78" width="50" height="25" rx="4" fill="#F1EFE8" stroke="#B4B2A9" stroke-width="1"/>
+          <text x="660" y="95" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#5C5B56">Y₁ᵖ</text>
+
+          <rect x="635" y="118" width="50" height="25" rx="4" fill="#F1EFE8" stroke="#B4B2A9" stroke-width="1"/>
+          <text x="660" y="135" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#5C5B56">Y₂ᵖ</text>
+
+          <line x1="690" y1="110" x2="720" y2="110" stroke="#534AB7" stroke-width="2" marker-end="url(#ch14-arr3)"/>
+
+          <rect x="730" y="85" width="50" height="50" rx="4" fill="#534AB7" stroke="#534AB7" stroke-width="1"/>
+          <text x="755" y="114" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#FFFFFF">Y</text>
+
+          <text x="755" y="75" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#9C9A94">b × d</text>
+
+          <text x="720" y="155" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="500" fill="#534AB7">all-reduce</text>
+          <text x="600" y="175" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#993C1D">Sync required → Y = Σᵢ Yᵢᵖ</text>
+
+          <!-- MLP composition diagram below -->
+          <text x="400" y="210" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="600" fill="#1A1A18">Megatron MLP: Column-Parallel → GeLU → Row-Parallel → All-Reduce</text>
+
+          <!-- MLP flow -->
+          <rect x="60" y="230" width="100" height="36" rx="6" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1.5"/>
+          <text x="110" y="252" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="500" fill="#0F6E56">Input X</text>
+
+          <line x1="160" y1="248" x2="185" y2="248" stroke="#9C9A94" stroke-width="1.5" marker-end="url(#ch14-arr3)"/>
+
+          <rect x="190" y="230" width="120" height="36" rx="6" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1.5"/>
+          <text x="250" y="252" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#534AB7">Column-Parallel</text>
+
+          <line x1="310" y1="248" x2="335" y2="248" stroke="#9C9A94" stroke-width="1.5" marker-end="url(#ch14-arr3)"/>
+
+          <rect x="340" y="230" width="70" height="36" rx="6" fill="#FAEEDA" stroke="#EF9F27" stroke-width="1.5"/>
+          <text x="375" y="252" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#854F0B">GeLU</text>
+
+          <line x1="410" y1="248" x2="435" y2="248" stroke="#9C9A94" stroke-width="1.5" marker-end="url(#ch14-arr3)"/>
+
+          <rect x="440" y="230" width="120" height="36" rx="6" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1.5"/>
+          <text x="500" y="252" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#534AB7">Row-Parallel</text>
+
+          <line x1="560" y1="248" x2="585" y2="248" stroke="#534AB7" stroke-width="2" marker-end="url(#ch14-arr3)"/>
+
+          <rect x="590" y="230" width="90" height="36" rx="6" fill="#534AB7" stroke="#534AB7"/>
+          <text x="635" y="252" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#FFFFFF">All-Reduce</text>
+
+          <line x1="680" y1="248" x2="705" y2="248" stroke="#9C9A94" stroke-width="1.5" marker-end="url(#ch14-arr3)"/>
+
+          <rect x="710" y="230" width="70" height="36" rx="6" fill="#FAECE7" stroke="#F0997B" stroke-width="1.5"/>
+          <text x="745" y="252" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="500" fill="#993C1D">Output</text>
+
+          <text x="400" y="290" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#9C9A94">One all-reduce per MLP forward · Self-attention follows the same pattern for Q/K/V projections</text>
+
+          <!-- Total comm annotation -->
+          <text x="400" y="316" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#5C5B56">Total per transformer layer: 4 all-reduces (2 forward + 2 backward)</text>
+          <text x="400" y="336" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#9C9A94">Communication per layer per microbatch: 8 · b · s · h · (t−1)/t bytes</text>
+          <text x="400" y="356" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#9C9A94">(b = microbatch, s = seq_len, h = hidden_dim, t = TP degree)</text>
+        </svg>
+        <figcaption>Figure 14.3 — Megatron-LM tensor parallelism. Top-left: column-parallel linear splits the weight matrix along output columns — no synchronization needed before the activation function. Top-right: row-parallel linear splits along input rows — an all-reduce sums the partial outputs. Bottom: in the MLP, the first linear is column-parallel and the second is row-parallel, requiring only one all-reduce per MLP forward pass.</figcaption>
+      </figure>
+
+      <p>Megatron-LM uses conjugate operators $f$ and $g$ to handle the forward and backward passes. In the forward pass, $f$ is the identity (input is replicated) and $g$ performs the all-reduce. In the backward pass, the roles reverse. This elegant design means the MLP requires exactly one all-reduce in the forward pass and one in the backward pass. Self-attention follows the same pattern: Q, K, V projections are column-parallel (each GPU handles a subset of attention heads), attention is computed independently, and the output projection is row-parallel with an all-reduce.</p>
+
+      <p>The following implements a simplified column-parallel linear layer.</p>
+
+<pre><code class="language-python">
+import torch
+import torch.nn as nn
+import torch.distributed as dist
+
+class ColumnParallelLinear(nn.Module):
+    """Megatron-style column-parallel linear layer.
+    Splits weight along output dimension across TP group."""
+
+    def __init__(self, in_features, out_features, tp_group):
+        super().__init__()
+        self.tp_group = tp_group
+        self.tp_size = dist.get_world_size(group=tp_group)
+        self.local_out = out_features // self.tp_size
+        # Each GPU holds a column slice: (in_features, out_features / tp_size)
+        self.weight = nn.Parameter(torch.randn(in_features, self.local_out) * 0.02)
+        self.bias = nn.Parameter(torch.zeros(self.local_out))
+
+    def forward(self, x):
+        # x: (batch, seq_len, in_features) — replicated on all TP ranks
+        # Local matmul: no communication needed
+        out = x @ self.weight + self.bias  # (batch, seq_len, local_out)
+        return out  # each GPU holds different columns of the full output
+
+class RowParallelLinear(nn.Module):
+    """Row-parallel: splits weight along input dimension, all-reduces output."""
+
+    def __init__(self, in_features, out_features, tp_group):
+        super().__init__()
+        self.tp_group = tp_group
+        self.tp_size = dist.get_world_size(group=tp_group)
+        self.local_in = in_features // self.tp_size
+        self.weight = nn.Parameter(torch.randn(self.local_in, out_features) * 0.02)
+        self.bias = nn.Parameter(torch.zeros(out_features))
+
+    def forward(self, x):
+        # x: (batch, seq_len, local_in) — each GPU holds its column slice
+        out = x @ self.weight             # (batch, seq_len, out_features) partial
+        dist.all_reduce(out, group=self.tp_group)  # sum partial results
+        return out + self.bias            # (batch, seq_len, out_features) complete
+</code></pre>
+
+      <h3>Pipeline Parallelism</h3>
+
+      <p>While tensor parallelism splits within a layer, <strong>pipeline parallelism</strong> splits across layers. The model's $L$ layers are divided into $p$ stages, each assigned to a different GPU. Data flows sequentially through the stages, like an assembly line. The challenge is the <strong>pipeline bubble</strong>: during startup and shutdown, some stages sit idle.</p>
+
+      <p><strong>GPipe</strong> (Huang et al., NeurIPS 2019) splits each mini-batch into $m$ micro-batches and runs all forward passes first, then all backward passes. The bubble fraction is:</p>
+
+      <div class="math-block">
+        $$B_{\text{GPipe}} = \frac{p - 1}{m + p - 1}$$
+      </div>
+
+      <p>where $p$ is the number of pipeline stages and $m$ is the number of micro-batches. With $p = 4$ stages and $m = 32$ micro-batches, the bubble is only $3/35 \approx 8.6\%$. However, GPipe stores activations for all $m$ micro-batches simultaneously, consuming significant memory.</p>
+
+      <p>The <strong>1F1B schedule</strong> (one-forward-one-backward, Narayanan et al., SC 2021) interleaves forward and backward passes. After the warmup phase, each stage alternates between forwarding the next micro-batch and backwarding a completed one. This limits in-flight activations to $p$ micro-batches instead of $m$, dramatically reducing memory at the cost of a slightly different bubble formula: $B_{\text{1F1B}} = (p - 1) / m$.</p>
+
+      <figure class="diagram-figure">
+        <svg width="100%" viewBox="0 0 800 420" xmlns="http://www.w3.org/2000/svg">
+          <!-- GPipe Schedule -->
+          <text x="400" y="20" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="13" font-weight="600" fill="#1A1A18">Pipeline Parallelism Schedules (p=4 stages, m=4 micro-batches)</text>
+
+          <text x="50" y="56" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="500" fill="#534AB7">GPipe</text>
+
+          <!-- Stage labels -->
+          <text x="30" y="80" text-anchor="end" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#9C9A94">S1</text>
+          <text x="30" y="105" text-anchor="end" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#9C9A94">S2</text>
+          <text x="30" y="130" text-anchor="end" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#9C9A94">S3</text>
+          <text x="30" y="155" text-anchor="end" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#9C9A94">S4</text>
+
+          <!-- GPipe Forward micro-batches (teal) -->
+          <rect x="40" y="68" width="45" height="20" rx="3" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1"/>
+          <text x="62" y="82" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#0F6E56">F1</text>
+          <rect x="88" y="68" width="45" height="20" rx="3" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1"/>
+          <text x="110" y="82" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#0F6E56">F2</text>
+          <rect x="136" y="68" width="45" height="20" rx="3" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1"/>
+          <text x="158" y="82" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#0F6E56">F3</text>
+          <rect x="184" y="68" width="45" height="20" rx="3" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1"/>
+          <text x="206" y="82" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#0F6E56">F4</text>
+
+          <!-- Stage 2 forward -->
+          <rect x="88" y="93" width="45" height="20" rx="3" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1"/>
+          <text x="110" y="107" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#0F6E56">F1</text>
+          <rect x="136" y="93" width="45" height="20" rx="3" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1"/>
+          <text x="158" y="107" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#0F6E56">F2</text>
+          <rect x="184" y="93" width="45" height="20" rx="3" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1"/>
+          <text x="206" y="107" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#0F6E56">F3</text>
+          <rect x="232" y="93" width="45" height="20" rx="3" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1"/>
+          <text x="254" y="107" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#0F6E56">F4</text>
+
+          <!-- Stage 3 forward -->
+          <rect x="136" y="118" width="45" height="20" rx="3" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1"/>
+          <text x="158" y="132" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#0F6E56">F1</text>
+          <rect x="184" y="118" width="45" height="20" rx="3" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1"/>
+          <text x="206" y="132" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#0F6E56">F2</text>
+          <rect x="232" y="118" width="45" height="20" rx="3" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1"/>
+          <text x="254" y="132" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#0F6E56">F3</text>
+          <rect x="280" y="118" width="45" height="20" rx="3" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1"/>
+          <text x="302" y="132" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#0F6E56">F4</text>
+
+          <!-- Stage 4 forward -->
+          <rect x="184" y="143" width="45" height="20" rx="3" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1"/>
+          <text x="206" y="157" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#0F6E56">F1</text>
+          <rect x="232" y="143" width="45" height="20" rx="3" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1"/>
+          <text x="254" y="157" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#0F6E56">F2</text>
+          <rect x="280" y="143" width="45" height="20" rx="3" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1"/>
+          <text x="302" y="157" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#0F6E56">F3</text>
+          <rect x="328" y="143" width="45" height="20" rx="3" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1"/>
+          <text x="350" y="157" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#0F6E56">F4</text>
+
+          <!-- GPipe backward (coral) — stage 4 first -->
+          <rect x="376" y="143" width="45" height="20" rx="3" fill="#FAECE7" stroke="#F0997B" stroke-width="1"/>
+          <text x="398" y="157" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#993C1D">B1</text>
+          <rect x="424" y="143" width="45" height="20" rx="3" fill="#FAECE7" stroke="#F0997B" stroke-width="1"/>
+          <text x="446" y="157" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#993C1D">B2</text>
+          <rect x="472" y="143" width="45" height="20" rx="3" fill="#FAECE7" stroke="#F0997B" stroke-width="1"/>
+          <text x="494" y="157" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#993C1D">B3</text>
+          <rect x="520" y="143" width="45" height="20" rx="3" fill="#FAECE7" stroke="#F0997B" stroke-width="1"/>
+          <text x="542" y="157" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#993C1D">B4</text>
+
+          <!-- Stage 3 backward -->
+          <rect x="424" y="118" width="45" height="20" rx="3" fill="#FAECE7" stroke="#F0997B" stroke-width="1"/>
+          <text x="446" y="132" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#993C1D">B1</text>
+          <rect x="472" y="118" width="45" height="20" rx="3" fill="#FAECE7" stroke="#F0997B" stroke-width="1"/>
+          <text x="494" y="132" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#993C1D">B2</text>
+          <rect x="520" y="118" width="45" height="20" rx="3" fill="#FAECE7" stroke="#F0997B" stroke-width="1"/>
+          <text x="542" y="132" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#993C1D">B3</text>
+          <rect x="568" y="118" width="45" height="20" rx="3" fill="#FAECE7" stroke="#F0997B" stroke-width="1"/>
+          <text x="590" y="132" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#993C1D">B4</text>
+
+          <!-- Stage 2 backward -->
+          <rect x="472" y="93" width="45" height="20" rx="3" fill="#FAECE7" stroke="#F0997B" stroke-width="1"/>
+          <text x="494" y="107" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#993C1D">B1</text>
+          <rect x="520" y="93" width="45" height="20" rx="3" fill="#FAECE7" stroke="#F0997B" stroke-width="1"/>
+          <text x="542" y="107" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#993C1D">B2</text>
+          <rect x="568" y="93" width="45" height="20" rx="3" fill="#FAECE7" stroke="#F0997B" stroke-width="1"/>
+          <text x="590" y="107" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#993C1D">B3</text>
+          <rect x="616" y="93" width="45" height="20" rx="3" fill="#FAECE7" stroke="#F0997B" stroke-width="1"/>
+          <text x="638" y="107" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#993C1D">B4</text>
+
+          <!-- Stage 1 backward -->
+          <rect x="520" y="68" width="45" height="20" rx="3" fill="#FAECE7" stroke="#F0997B" stroke-width="1"/>
+          <text x="542" y="82" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#993C1D">B1</text>
+          <rect x="568" y="68" width="45" height="20" rx="3" fill="#FAECE7" stroke="#F0997B" stroke-width="1"/>
+          <text x="590" y="82" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#993C1D">B2</text>
+          <rect x="616" y="68" width="45" height="20" rx="3" fill="#FAECE7" stroke="#F0997B" stroke-width="1"/>
+          <text x="638" y="82" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#993C1D">B3</text>
+          <rect x="664" y="68" width="45" height="20" rx="3" fill="#FAECE7" stroke="#F0997B" stroke-width="1"/>
+          <text x="686" y="82" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#993C1D">B4</text>
+
+          <!-- Bubble annotation for GPipe -->
+          <text x="720" y="112" text-anchor="start" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="500" fill="#993C1D">Bubble: 43%</text>
+
+          <!-- Separator -->
+          <line x1="30" y1="185" x2="770" y2="185" stroke="#E5E3DC" stroke-width="1"/>
+
+          <!-- 1F1B Schedule -->
+          <text x="50" y="210" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="500" fill="#0F6E56">1F1B</text>
+
+          <!-- Stage labels -->
+          <text x="30" y="234" text-anchor="end" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#9C9A94">S1</text>
+          <text x="30" y="259" text-anchor="end" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#9C9A94">S2</text>
+          <text x="30" y="284" text-anchor="end" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#9C9A94">S3</text>
+          <text x="30" y="309" text-anchor="end" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#9C9A94">S4</text>
+
+          <!-- 1F1B Stage 1: F1 F2 F3 F4 B1 B2 B3 B4 -->
+          <rect x="40" y="222" width="40" height="20" rx="3" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1"/>
+          <text x="60" y="236" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#0F6E56">F1</text>
+          <rect x="83" y="222" width="40" height="20" rx="3" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1"/>
+          <text x="103" y="236" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#0F6E56">F2</text>
+          <rect x="126" y="222" width="40" height="20" rx="3" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1"/>
+          <text x="146" y="236" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#0F6E56">F3</text>
+          <rect x="169" y="222" width="40" height="20" rx="3" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1"/>
+          <text x="189" y="236" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#0F6E56">F4</text>
+          <rect x="212" y="222" width="40" height="20" rx="3" fill="#FAECE7" stroke="#F0997B" stroke-width="1"/>
+          <text x="232" y="236" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#993C1D">B1</text>
+          <rect x="255" y="222" width="40" height="20" rx="3" fill="#FAECE7" stroke="#F0997B" stroke-width="1"/>
+          <text x="275" y="236" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#993C1D">B2</text>
+          <rect x="298" y="222" width="40" height="20" rx="3" fill="#FAECE7" stroke="#F0997B" stroke-width="1"/>
+          <text x="318" y="236" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#993C1D">B3</text>
+          <rect x="341" y="222" width="40" height="20" rx="3" fill="#FAECE7" stroke="#F0997B" stroke-width="1"/>
+          <text x="361" y="236" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#993C1D">B4</text>
+
+          <!-- 1F1B Stage 2: warmup then interleave -->
+          <rect x="83" y="247" width="40" height="20" rx="3" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1"/>
+          <text x="103" y="261" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#0F6E56">F1</text>
+          <rect x="126" y="247" width="40" height="20" rx="3" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1"/>
+          <text x="146" y="261" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#0F6E56">F2</text>
+          <rect x="169" y="247" width="40" height="20" rx="3" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1"/>
+          <text x="189" y="261" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#0F6E56">F3</text>
+          <rect x="212" y="247" width="40" height="20" rx="3" fill="#FAECE7" stroke="#F0997B" stroke-width="1"/>
+          <text x="232" y="261" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#993C1D">B1</text>
+          <rect x="255" y="247" width="40" height="20" rx="3" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1"/>
+          <text x="275" y="261" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#0F6E56">F4</text>
+          <rect x="298" y="247" width="40" height="20" rx="3" fill="#FAECE7" stroke="#F0997B" stroke-width="1"/>
+          <text x="318" y="261" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#993C1D">B2</text>
+          <rect x="341" y="247" width="40" height="20" rx="3" fill="#FAECE7" stroke="#F0997B" stroke-width="1"/>
+          <text x="361" y="261" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#993C1D">B3</text>
+          <rect x="384" y="247" width="40" height="20" rx="3" fill="#FAECE7" stroke="#F0997B" stroke-width="1"/>
+          <text x="404" y="261" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#993C1D">B4</text>
+
+          <!-- 1F1B Stage 3 -->
+          <rect x="126" y="272" width="40" height="20" rx="3" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1"/>
+          <text x="146" y="286" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#0F6E56">F1</text>
+          <rect x="169" y="272" width="40" height="20" rx="3" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1"/>
+          <text x="189" y="286" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#0F6E56">F2</text>
+          <rect x="212" y="272" width="40" height="20" rx="3" fill="#FAECE7" stroke="#F0997B" stroke-width="1"/>
+          <text x="232" y="286" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#993C1D">B1</text>
+          <rect x="255" y="272" width="40" height="20" rx="3" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1"/>
+          <text x="275" y="286" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#0F6E56">F3</text>
+          <rect x="298" y="272" width="40" height="20" rx="3" fill="#FAECE7" stroke="#F0997B" stroke-width="1"/>
+          <text x="318" y="286" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#993C1D">B2</text>
+          <rect x="341" y="272" width="40" height="20" rx="3" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1"/>
+          <text x="361" y="286" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#0F6E56">F4</text>
+          <rect x="384" y="272" width="40" height="20" rx="3" fill="#FAECE7" stroke="#F0997B" stroke-width="1"/>
+          <text x="404" y="286" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#993C1D">B3</text>
+          <rect x="427" y="272" width="40" height="20" rx="3" fill="#FAECE7" stroke="#F0997B" stroke-width="1"/>
+          <text x="447" y="286" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#993C1D">B4</text>
+
+          <!-- 1F1B Stage 4 -->
+          <rect x="169" y="297" width="40" height="20" rx="3" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1"/>
+          <text x="189" y="311" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#0F6E56">F1</text>
+          <rect x="212" y="297" width="40" height="20" rx="3" fill="#FAECE7" stroke="#F0997B" stroke-width="1"/>
+          <text x="232" y="311" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#993C1D">B1</text>
+          <rect x="255" y="297" width="40" height="20" rx="3" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1"/>
+          <text x="275" y="311" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#0F6E56">F2</text>
+          <rect x="298" y="297" width="40" height="20" rx="3" fill="#FAECE7" stroke="#F0997B" stroke-width="1"/>
+          <text x="318" y="311" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#993C1D">B2</text>
+          <rect x="341" y="297" width="40" height="20" rx="3" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1"/>
+          <text x="361" y="311" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#0F6E56">F3</text>
+          <rect x="384" y="297" width="40" height="20" rx="3" fill="#FAECE7" stroke="#F0997B" stroke-width="1"/>
+          <text x="404" y="311" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#993C1D">B3</text>
+          <rect x="427" y="297" width="40" height="20" rx="3" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1"/>
+          <text x="447" y="311" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#0F6E56">F4</text>
+          <rect x="470" y="297" width="40" height="20" rx="3" fill="#FAECE7" stroke="#F0997B" stroke-width="1"/>
+          <text x="490" y="311" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#993C1D">B4</text>
+
+          <!-- 1F1B bubble annotation -->
+          <text x="540" y="267" text-anchor="start" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="500" fill="#0F6E56">Bubble: 75% (m=4)</text>
+          <text x="540" y="283" text-anchor="start" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#9C9A94">But memory: p vs m</text>
+          <text x="540" y="299" text-anchor="start" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#9C9A94">At m=32: only 9.4%</text>
+
+          <!-- Legend -->
+          <rect x="200" y="340" width="30" height="16" rx="3" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1"/>
+          <text x="238" y="352" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#5C5B56">Forward</text>
+          <rect x="300" y="340" width="30" height="16" rx="3" fill="#FAECE7" stroke="#F0997B" stroke-width="1"/>
+          <text x="338" y="352" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#5C5B56">Backward</text>
+          <rect x="410" y="340" width="30" height="16" rx="3" fill="#F1EFE8" stroke="#C8C6BE" stroke-width="1"/>
+          <text x="448" y="352" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#5C5B56">Idle (bubble)</text>
+
+          <text x="400" y="390" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#5C5B56">In practice, m ≫ p (e.g., m=32, p=4), reducing bubble to under 10% for both schedules.</text>
+          <text x="400" y="408" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#9C9A94">Zero Bubble (Qi et al., ICLR 2024) splits backward into B and W passes, scheduling W in bubble slots → near-zero overhead.</text>
+        </svg>
+        <figcaption>Figure 14.4 — Pipeline parallelism schedules with 4 stages and 4 micro-batches. Top: GPipe runs all forwards then all backwards — 43% bubble at m=4. Bottom: 1F1B interleaves forward and backward passes, limiting in-flight activations to p instead of m. Both schedules improve dramatically with more micro-batches (m=32 → under 10% bubble).</figcaption>
+      </figure>
+
+    </section>
+
+    <!-- ============================================================ -->
+    <!-- SECTION 3: ZERO OPTIMIZER                                    -->
+    <!-- ============================================================ -->
+    <section class="chapter-section" id="zero-optimizer">
+      <h2>ZeRO: Zero Redundancy Optimizer</h2>
+
+      <p>Data parallelism duplicates the entire training state on every GPU: parameters, gradients, and optimizer states. For a model with $\Psi$ parameters using mixed-precision AdamW, the per-parameter memory cost is: 2 bytes for BF16 parameters + 2 bytes for BF16 gradients + 4 bytes for FP32 parameter copy + 4 bytes for FP32 first moment + 4 bytes for FP32 second moment = <strong>16 bytes per parameter</strong>. For a 7B model, that is 112GB — replicated on every single GPU.</p>
+
+      <p>The ZeRO optimizer (Rajbhandari et al., SC 2020) eliminates this redundancy by partitioning instead of replicating. Across $N$ data-parallel GPUs:</p>
+
+      <table>
+        <thead>
+          <tr><th>Stage</th><th>What is partitioned</th><th>Memory per GPU</th><th>7B on 8 GPUs</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>No ZeRO</td><td>Nothing (full replicas)</td><td>$16\Psi$</td><td>112 GB</td></tr>
+          <tr><td>Stage 1</td><td>Optimizer states</td><td>$(4 + 12/N)\Psi$</td><td>38.5 GB</td></tr>
+          <tr><td>Stage 2</td><td>+ Gradients</td><td>$(2 + 14/N)\Psi$</td><td>26.25 GB</td></tr>
+          <tr><td>Stage 3</td><td>+ Parameters</td><td>$16\Psi / N$</td><td>14 GB</td></tr>
+        </tbody>
+      </table>
+
+      <figure class="diagram-figure">
+        <svg width="100%" viewBox="0 0 800 380" xmlns="http://www.w3.org/2000/svg">
+          <!-- Title -->
+          <text x="400" y="24" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="13" font-weight="600" fill="#1A1A18">Per-GPU Memory: ZeRO Stages (7B model, 8 GPUs)</text>
+
+          <!-- Y-axis -->
+          <line x1="100" y1="50" x2="100" y2="320" stroke="#C8C6BE" stroke-width="1"/>
+          <text x="90" y="58" text-anchor="end" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#9C9A94">112 GB</text>
+          <text x="90" y="160" text-anchor="end" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#9C9A94">56 GB</text>
+          <text x="90" y="320" text-anchor="end" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#9C9A94">0 GB</text>
+
+          <line x1="95" y1="50" x2="100" y2="50" stroke="#C8C6BE" stroke-width="1"/>
+          <line x1="95" y1="160" x2="100" y2="160" stroke="#C8C6BE" stroke-width="1"/>
+
+          <!-- No ZeRO bar (112GB total) - height 270 for full scale -->
+          <!-- Optimizer: 84GB = 75% = 202px, Gradients: 14GB = 12.5% = 34px, Params: 14GB = 12.5% = 34px -->
+          <rect x="130" y="50" width="100" height="34" rx="0" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1"/>
+          <text x="180" y="72" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="500" fill="#534AB7">Params 14GB</text>
+          <rect x="130" y="84" width="100" height="34" rx="0" fill="#FAEEDA" stroke="#EF9F27" stroke-width="1"/>
+          <text x="180" y="106" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="500" fill="#854F0B">Grads 14GB</text>
+          <rect x="130" y="118" width="100" height="202" rx="0" fill="#FAECE7" stroke="#F0997B" stroke-width="1"/>
+          <text x="180" y="224" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="500" fill="#993C1D">Optimizer 84GB</text>
+          <text x="180" y="340" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#1A1A18">No ZeRO</text>
+
+          <!-- Stage 1 bar (38.5GB) -->
+          <!-- Params: 14GB, Grads: 14GB, Optim: 10.5GB (84/8) -->
+          <!-- Scale: 38.5/112 * 270 = 92.8px from top -->
+          <rect x="280" y="227" width="100" height="24" rx="0" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1"/>
+          <text x="330" y="243" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="500" fill="#534AB7">Params</text>
+          <rect x="280" y="251" width="100" height="24" rx="0" fill="#FAEEDA" stroke="#EF9F27" stroke-width="1"/>
+          <text x="330" y="267" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="500" fill="#854F0B">Grads</text>
+          <rect x="280" y="275" width="100" height="45" rx="0" fill="#FAECE7" stroke="#F0997B" stroke-width="1"/>
+          <text x="330" y="302" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="500" fill="#993C1D">Optim /N</text>
+          <text x="330" y="340" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#1A1A18">Stage 1</text>
+          <text x="330" y="356" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#9C9A94">38.5 GB</text>
+
+          <!-- Stage 2 bar (26.25GB) -->
+          <rect x="430" y="257" width="100" height="21" rx="0" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1"/>
+          <text x="480" y="271" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="500" fill="#534AB7">Params</text>
+          <rect x="430" y="278" width="100" height="15" rx="0" fill="#FAEEDA" stroke="#EF9F27" stroke-width="1"/>
+          <text x="480" y="290" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="8" font-weight="500" fill="#854F0B">G /N</text>
+          <rect x="430" y="293" width="100" height="27" rx="0" fill="#FAECE7" stroke="#F0997B" stroke-width="1"/>
+          <text x="480" y="311" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="500" fill="#993C1D">Optim /N</text>
+          <text x="480" y="340" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#1A1A18">Stage 2</text>
+          <text x="480" y="356" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#9C9A94">26.25 GB</text>
+
+          <!-- Stage 3 bar (14GB) -->
+          <rect x="580" y="286" width="100" height="11" rx="0" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1"/>
+          <rect x="580" y="297" width="100" height="8" rx="0" fill="#FAEEDA" stroke="#EF9F27" stroke-width="1"/>
+          <rect x="580" y="305" width="100" height="15" rx="0" fill="#FAECE7" stroke="#F0997B" stroke-width="1"/>
+          <text x="630" y="274" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="500" fill="#5C5B56">All /N</text>
+          <text x="630" y="340" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#1A1A18">Stage 3</text>
+          <text x="630" y="356" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#9C9A94">14 GB</text>
+
+          <!-- Reduction labels -->
+          <text x="330" y="218" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="500" fill="#0F6E56">4× reduction</text>
+          <text x="480" y="248" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="500" fill="#0F6E56">8× reduction</text>
+          <text x="630" y="248" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="500" fill="#0F6E56">N× reduction</text>
+
+          <!-- Legend -->
+          <rect x="240" y="370" width="14" height="10" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1"/>
+          <text x="260" y="378" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#5C5B56">Parameters</text>
+          <rect x="340" y="370" width="14" height="10" fill="#FAEEDA" stroke="#EF9F27" stroke-width="1"/>
+          <text x="360" y="378" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#5C5B56">Gradients</text>
+          <rect x="440" y="370" width="14" height="10" fill="#FAECE7" stroke="#F0997B" stroke-width="1"/>
+          <text x="460" y="378" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#5C5B56">Optimizer States</text>
+        </svg>
+        <figcaption>Figure 14.5 — Per-GPU memory consumption across ZeRO stages for a 7B parameter model on 8 GPUs. Without ZeRO, each GPU stores 112GB of redundant training state. Stage 1 partitions optimizer states (4× reduction). Stage 2 adds gradient partitioning (8×). Stage 3 partitions everything (N× = 8×), bringing per-GPU memory to just 14GB.</figcaption>
+      </figure>
+
+      <p>The communication cost is modest. Stages 1 and 2 communicate the same volume as standard DDP all-reduce: $2|\theta|$ elements. Stage 3 adds an extra all-gather of parameters before each forward pass, bringing the total to $3|\theta|$ — a 1.5× increase over DDP.</p>
+
+      <p><strong>ZeRO-Infinity</strong> extends this further by offloading partitions to CPU memory or NVMe SSDs. With CPU offloading, a single DGX node with 8 GPUs can train models with over a trillion parameters — limited by CPU memory (typically 1-2TB) rather than GPU memory.</p>
+
+      <h3>FSDP: PyTorch-Native ZeRO Stage 3</h3>
+
+      <p>PyTorch's <strong>Fully Sharded Data Parallel</strong> (FSDP) implements ZeRO Stage 3 natively. The newer FSDP2 API (TorchTitan, 2024) uses per-parameter DTensor sharding, achieving 7% lower peak memory than FSDP1 and composing cleanly with tensor and pipeline parallelism.</p>
+
+<pre><code class="language-python">
+import torch
+from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy
+
+def setup_fsdp_training(model, lr=3e-4):
+    """Configure FSDP2 (ZeRO Stage 3) with mixed precision."""
+    mp_policy = MixedPrecisionPolicy(
+        param_dtype=torch.bfloat16,
+        reduce_dtype=torch.float32,   # all-reduce in FP32 for stability
+    )
+    # Shard each transformer layer independently for optimal communication
+    for layer in model.layers:
+        fully_shard(layer, mp_policy=mp_policy)
+    # Shard the full model (handles embeddings and output head)
+    fully_shard(model, mp_policy=mp_policy)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.1)
+    return model, optimizer
+
+# Training loop is identical to single-GPU — FSDP handles sharding transparently
+# model, optimizer = setup_fsdp_training(model)
+# for batch in loader:
+#     loss = model(batch["input_ids"]).loss   # FSDP all-gathers params on demand
+#     loss.backward()                          # FSDP reduce-scatters gradients
+#     optimizer.step()                         # each rank updates its shard
+#     optimizer.zero_grad()
+</code></pre>
+
+      <div class="callout callout-insight">
+        <div class="callout-title">Key Insight</div>
+        <p>ZeRO does not change the mathematical computation at all — every gradient, parameter update, and forward pass produces exactly the same result as naive data parallelism. It only changes <em>where</em> things are stored. The optimizer states, gradients, and parameters still exist in full — they are just partitioned across GPUs instead of redundantly replicated. Communication fills in the gaps just-in-time.</p>
+      </div>
+
+    </section>
+
+    <!-- ============================================================ -->
+    <!-- SECTION 4: 3D PARALLELISM                                    -->
+    <!-- ============================================================ -->
+    <section class="chapter-section" id="3d-parallelism">
+      <h2>3D Parallelism</h2>
+
+      <p>Data parallelism, tensor parallelism, and pipeline parallelism are not competing alternatives — they are orthogonal dimensions that compose. A cluster of GPUs is logically organized as a 3D grid where each axis handles a different bottleneck: TP handles within-layer memory, PP handles cross-layer memory, and DP handles throughput scaling.</p>
+
+      <figure class="diagram-figure">
+        <svg width="100%" viewBox="0 0 800 440" xmlns="http://www.w3.org/2000/svg">
+          <defs>
+            <marker id="ch14-arr4" viewBox="0 0 10 10" refX="9" refY="5"
+              markerWidth="5" markerHeight="5" orient="auto-start-reverse">
+              <path d="M1 1L9 5L1 9" fill="none" stroke="context-stroke"
+                stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+            </marker>
+          </defs>
+
+          <text x="400" y="24" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="13" font-weight="600" fill="#1A1A18">3D Parallelism: 64 GPUs = DP 8 × TP 4 × PP 2</text>
+
+          <!-- Isometric-ish grid: TP along x, PP along diagonal, DP along y -->
+          <!-- Row 0 (DP rank 0) -->
+          <!-- PP stage 0, TP group -->
+          <rect x="120" y="60" width="50" height="30" rx="4" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1.5"/>
+          <rect x="175" y="60" width="50" height="30" rx="4" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1.5"/>
+          <rect x="230" y="60" width="50" height="30" rx="4" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1.5"/>
+          <rect x="285" y="60" width="50" height="30" rx="4" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1.5"/>
+
+          <!-- PP stage 1, TP group -->
+          <rect x="370" y="60" width="50" height="30" rx="4" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1.5"/>
+          <rect x="425" y="60" width="50" height="30" rx="4" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1.5"/>
+          <rect x="480" y="60" width="50" height="30" rx="4" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1.5"/>
+          <rect x="535" y="60" width="50" height="30" rx="4" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1.5"/>
+
+          <!-- DP replicas (rows 1-3 shown, 4-7 indicated) -->
+          <rect x="120" y="100" width="50" height="30" rx="4" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1" opacity="0.6"/>
+          <rect x="175" y="100" width="50" height="30" rx="4" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1" opacity="0.6"/>
+          <rect x="230" y="100" width="50" height="30" rx="4" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1" opacity="0.6"/>
+          <rect x="285" y="100" width="50" height="30" rx="4" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1" opacity="0.6"/>
+          <rect x="370" y="100" width="50" height="30" rx="4" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1" opacity="0.6"/>
+          <rect x="425" y="100" width="50" height="30" rx="4" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1" opacity="0.6"/>
+          <rect x="480" y="100" width="50" height="30" rx="4" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1" opacity="0.6"/>
+          <rect x="535" y="100" width="50" height="30" rx="4" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1" opacity="0.6"/>
+
+          <rect x="120" y="140" width="50" height="30" rx="4" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1" opacity="0.35"/>
+          <rect x="175" y="140" width="50" height="30" rx="4" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1" opacity="0.35"/>
+          <rect x="230" y="140" width="50" height="30" rx="4" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1" opacity="0.35"/>
+          <rect x="285" y="140" width="50" height="30" rx="4" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1" opacity="0.35"/>
+          <rect x="370" y="140" width="50" height="30" rx="4" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1" opacity="0.35"/>
+          <rect x="425" y="140" width="50" height="30" rx="4" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1" opacity="0.35"/>
+          <rect x="480" y="140" width="50" height="30" rx="4" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1" opacity="0.35"/>
+          <rect x="535" y="140" width="50" height="30" rx="4" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1" opacity="0.35"/>
+
+          <!-- DP "..." -->
+          <text x="145" y="190" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="14" font-weight="400" fill="#9C9A94">⋮</text>
+          <text x="395" y="190" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="14" font-weight="400" fill="#9C9A94">⋮</text>
+
+          <!-- Dimension labels with arrows -->
+          <!-- TP arrow (horizontal) -->
+          <line x1="120" y1="48" x2="335" y2="48" stroke="#534AB7" stroke-width="2" marker-end="url(#ch14-arr4)"/>
+          <text x="228" y="42" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="600" fill="#534AB7">TP = 4 (NVLink, 900 GB/s)</text>
+
+          <!-- PP arrow (between groups) -->
+          <line x1="340" y1="75" x2="365" y2="75" stroke="#0F6E56" stroke-width="2" marker-end="url(#ch14-arr4)"/>
+          <text x="352" y="55" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="500" fill="#0F6E56">PP</text>
+
+          <!-- DP arrow (vertical) -->
+          <line x1="600" y1="60" x2="600" y2="175" stroke="#993C1D" stroke-width="2" marker-end="url(#ch14-arr4)"/>
+          <text x="650" y="120" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="600" fill="#993C1D">DP = 8</text>
+
+          <!-- Node boundary -->
+          <rect x="110" y="54" width="240" height="42" rx="8" fill="none" stroke="#B4B2A9" stroke-width="1" stroke-dasharray="5 4"/>
+          <text x="230" y="108" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#9C9A94">Node 0 (8 GPUs)</text>
+
+          <rect x="360" y="54" width="240" height="42" rx="8" fill="none" stroke="#B4B2A9" stroke-width="1" stroke-dasharray="5 4"/>
+          <text x="480" y="108" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="400" fill="#9C9A94">Node 1</text>
+
+          <!-- Real configurations table -->
+          <text x="400" y="230" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="13" font-weight="600" fill="#1A1A18">Real-World 3D Parallelism Configurations</text>
+
+          <!-- Table header -->
+          <rect x="50" y="245" width="700" height="24" rx="0" fill="#F1EFE8"/>
+          <text x="130" y="261" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="600" fill="#1A1A18">Model</text>
+          <text x="240" y="261" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="600" fill="#1A1A18">GPUs</text>
+          <text x="330" y="261" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="600" fill="#1A1A18">TP</text>
+          <text x="400" y="261" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="600" fill="#1A1A18">PP</text>
+          <text x="470" y="261" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="600" fill="#1A1A18">DP</text>
+          <text x="580" y="261" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="600" fill="#1A1A18">Notes</text>
+
+          <!-- BLOOM -->
+          <text x="130" y="285" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#534AB7">BLOOM 176B</text>
+          <text x="240" y="285" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#5C5B56">384 A100</text>
+          <text x="330" y="285" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#5C5B56">8</text>
+          <text x="400" y="285" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#5C5B56">4</text>
+          <text x="470" y="285" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#5C5B56">12</text>
+          <text x="580" y="285" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#9C9A94">+ZeRO-1, 117 days</text>
+
+          <line x1="50" y1="293" x2="750" y2="293" stroke="#E5E3DC" stroke-width="0.5"/>
+
+          <!-- GPT-NeoX -->
+          <text x="130" y="309" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#534AB7">GPT-NeoX 20B</text>
+          <text x="240" y="309" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#5C5B56">96 A100</text>
+          <text x="330" y="309" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#5C5B56">2</text>
+          <text x="400" y="309" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#5C5B56">4</text>
+          <text x="470" y="309" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#5C5B56">12</text>
+          <text x="580" y="309" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#9C9A94">Megatron-DeepSpeed</text>
+
+          <line x1="50" y1="317" x2="750" y2="317" stroke="#E5E3DC" stroke-width="0.5"/>
+
+          <!-- LLaMA 3 -->
+          <text x="130" y="333" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#534AB7">LLaMA 3 405B</text>
+          <text x="240" y="333" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#5C5B56">16,384 H100</text>
+          <text x="330" y="333" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#5C5B56">8</text>
+          <text x="400" y="333" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#5C5B56">16</text>
+          <text x="470" y="333" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#5C5B56">128</text>
+          <text x="580" y="333" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#9C9A94">FSDP, +CP for 131K</text>
+
+          <line x1="50" y1="341" x2="750" y2="341" stroke="#E5E3DC" stroke-width="0.5"/>
+
+          <!-- DeepSeek V3 -->
+          <text x="130" y="357" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#534AB7">DeepSeek V3 671B</text>
+          <text x="240" y="357" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#5C5B56">2,048 H800</text>
+          <text x="330" y="357" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#993C1D">0</text>
+          <text x="400" y="357" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#5C5B56">16</text>
+          <text x="470" y="357" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#5C5B56">—</text>
+          <text x="580" y="357" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#9C9A94">EP=64, no TP, $5.6M</text>
+
+          <line x1="50" y1="365" x2="750" y2="365" stroke="#E5E3DC" stroke-width="0.5"/>
+
+          <!-- Footer note -->
+          <text x="400" y="395" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#9C9A94">Key rule: TP ≤ 8 (within NVLink node). PP spans nodes over InfiniBand. DP fills remaining GPUs.</text>
+          <text x="400" y="412" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#9C9A94">DeepSeek V3 skipped TP entirely due to H800's reduced NVLink bandwidth (160 GB/s vs 900 GB/s on H100).</text>
+        </svg>
+        <figcaption>Figure 14.6 — 3D parallelism maps a GPU cluster to three orthogonal dimensions. Top: a 64-GPU example with TP=4 within each node (over NVLink), PP=2 across nodes (over InfiniBand), and DP=8 across the remaining axis. Bottom: real-world configurations from BLOOM, GPT-NeoX, LLaMA 3, and DeepSeek V3.</figcaption>
+      </figure>
+
+      <p>The rule of thumb for choosing parallelism degrees: <strong>TP ≤ 8</strong> to stay within a single NVLink-connected node (900 GB/s on H100), since tensor parallelism's all-reduces demand high bandwidth. <strong>PP spans nodes</strong> over InfiniBand (400 Gbps), since pipeline parallelism only sends activations between adjacent stages — lower volume, more latency-tolerant. <strong>DP fills the remaining dimension</strong>, scaling throughput with gradient all-reduces that are bandwidth-optimal via ring all-reduce.</p>
+
+      <p>DeepSeek V3 is a fascinating exception: it used *zero* tensor parallelism because the H800's NVLink bandwidth (160 GB/s, export-restricted) was only 3.2× faster than InfiniBand — not enough to justify the TP communication overhead. Instead, they used a novel DualPipe bidirectional pipeline schedule and expert parallelism for MoE routing, achieving 42.9% MFU while spending only $5.6M on the entire training run.</p>
+
+    </section>
+
+    <!-- ============================================================ -->
+    <!-- SECTION 5: TRAINING INFRASTRUCTURE                           -->
+    <!-- ============================================================ -->
+    <section class="chapter-section" id="training-infrastructure">
+      <h2>Training Infrastructure</h2>
+
+      <h3>GPU Cluster Topology</h3>
+
+      <p>Modern GPU clusters have a two-tier bandwidth hierarchy. Within a node, 8 GPUs communicate over NVLink via NVSwitch — 900 GB/s bidirectional on H100 (DGX H100). Across nodes, communication travels over InfiniBand or RoCE — NDR InfiniBand provides 400 Gbps per port, with DGX H100 nodes having 10 ConnectX-7 NICs for approximately 1 TB/s peak bidirectional bandwidth per node. The 18× bandwidth gap between intra-node and inter-node communication is the fundamental constraint that shapes parallelism decisions.</p>
+
+      <figure class="diagram-figure">
+        <svg width="100%" viewBox="0 0 800 300" xmlns="http://www.w3.org/2000/svg">
+          <defs>
+            <marker id="ch14-arr5" viewBox="0 0 10 10" refX="9" refY="5"
+              markerWidth="5" markerHeight="5" orient="auto-start-reverse">
+              <path d="M1 1L9 5L1 9" fill="none" stroke="context-stroke"
+                stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+            </marker>
+          </defs>
+
+          <text x="400" y="24" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="13" font-weight="600" fill="#1A1A18">GPU Cluster Topology: DGX H100</text>
+
+          <!-- Node 0 -->
+          <rect x="30" y="50" width="330" height="170" rx="10" fill="none" stroke="#B4B2A9" stroke-width="1.5" stroke-dasharray="6 4"/>
+          <text x="195" y="72" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="500" fill="#5C5B56">Node 0 (DGX H100)</text>
+
+          <!-- 8 GPU boxes in node 0 -->
+          <rect x="50" y="85" width="60" height="35" rx="4" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1.5"/>
+          <text x="80" y="107" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="500" fill="#534AB7">H100</text>
+          <rect x="120" y="85" width="60" height="35" rx="4" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1.5"/>
+          <text x="150" y="107" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="500" fill="#534AB7">H100</text>
+          <rect x="190" y="85" width="60" height="35" rx="4" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1.5"/>
+          <text x="220" y="107" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="500" fill="#534AB7">H100</text>
+          <rect x="260" y="85" width="60" height="35" rx="4" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1.5"/>
+          <text x="290" y="107" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="500" fill="#534AB7">H100</text>
+
+          <rect x="50" y="130" width="60" height="35" rx="4" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1.5"/>
+          <text x="80" y="152" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="500" fill="#534AB7">H100</text>
+          <rect x="120" y="130" width="60" height="35" rx="4" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1.5"/>
+          <text x="150" y="152" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="500" fill="#534AB7">H100</text>
+          <rect x="190" y="130" width="60" height="35" rx="4" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1.5"/>
+          <text x="220" y="152" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="500" fill="#534AB7">H100</text>
+          <rect x="260" y="130" width="60" height="35" rx="4" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1.5"/>
+          <text x="290" y="152" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="500" fill="#534AB7">H100</text>
+
+          <!-- NVLink cloud -->
+          <rect x="50" y="175" width="275" height="22" rx="4" fill="#534AB7" stroke="#534AB7"/>
+          <text x="188" y="190" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="500" fill="#FFFFFF">NVSwitch: 900 GB/s all-to-all</text>
+
+          <!-- Node 1 -->
+          <rect x="440" y="50" width="330" height="170" rx="10" fill="none" stroke="#B4B2A9" stroke-width="1.5" stroke-dasharray="6 4"/>
+          <text x="605" y="72" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="500" fill="#5C5B56">Node 1 (DGX H100)</text>
+
+          <!-- 8 GPU boxes in node 1 -->
+          <rect x="460" y="85" width="60" height="35" rx="4" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1.5"/>
+          <text x="490" y="107" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="500" fill="#0F6E56">H100</text>
+          <rect x="530" y="85" width="60" height="35" rx="4" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1.5"/>
+          <text x="560" y="107" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="500" fill="#0F6E56">H100</text>
+          <rect x="600" y="85" width="60" height="35" rx="4" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1.5"/>
+          <text x="630" y="107" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="500" fill="#0F6E56">H100</text>
+          <rect x="670" y="85" width="60" height="35" rx="4" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1.5"/>
+          <text x="700" y="107" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="500" fill="#0F6E56">H100</text>
+
+          <rect x="460" y="130" width="60" height="35" rx="4" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1.5"/>
+          <text x="490" y="152" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="500" fill="#0F6E56">H100</text>
+          <rect x="530" y="130" width="60" height="35" rx="4" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1.5"/>
+          <text x="560" y="152" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="500" fill="#0F6E56">H100</text>
+          <rect x="600" y="130" width="60" height="35" rx="4" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1.5"/>
+          <text x="630" y="152" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="500" fill="#0F6E56">H100</text>
+          <rect x="670" y="130" width="60" height="35" rx="4" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1.5"/>
+          <text x="700" y="152" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="500" fill="#0F6E56">H100</text>
+
+          <rect x="460" y="175" width="275" height="22" rx="4" fill="#0F6E56" stroke="#0F6E56"/>
+          <text x="598" y="190" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="500" fill="#FFFFFF">NVSwitch: 900 GB/s all-to-all</text>
+
+          <!-- InfiniBand connection -->
+          <line x1="360" y1="135" x2="440" y2="135" stroke="#854F0B" stroke-width="3"/>
+          <text x="400" y="250" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#854F0B">InfiniBand NDR: 400 Gbps × 10 ports = ~1 TB/s peak</text>
+          <text x="400" y="270" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#9C9A94">Intra-node / Inter-node bandwidth ratio: ~18× on H100, ~3.2× on H800</text>
+          <text x="400" y="290" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#9C9A94">This gap determines parallelism placement: TP within node, PP/DP across nodes</text>
+        </svg>
+        <figcaption>Figure 14.7 — GPU cluster bandwidth hierarchy. Within a DGX H100 node, 8 GPUs communicate at 900 GB/s via NVSwitch. Across nodes, InfiniBand NDR provides ~50 GB/s per direction — an 18× gap that dictates tensor parallelism must stay within a node.</figcaption>
+      </figure>
+
+      <h3>Activation Checkpointing</h3>
+
+      <p>During training, the forward pass stores intermediate activations for use in the backward pass. For a transformer with $L$ layers, this can consume enormous memory — a single layer with hidden size 4096 and sequence length 2048 stores roughly 830MB of activations in BF16. Across 80 layers, that is 66GB just for activations.</p>
+
+      <p><strong>Activation checkpointing</strong> (Chen et al., 2016) trades compute for memory: discard most activations during the forward pass and recompute them during the backward pass. Full checkpointing saves only the inputs to each segment of $\sqrt{L}$ layers, achieving $O(\sqrt{L})$ memory at the cost of 30-40% additional compute. <strong>Selective checkpointing</strong> (Korthikanti et al., MLSys 2023) is smarter: it recomputes only cheap, bandwidth-bound operations (layer normalization, GeLU, dropout) while keeping the expensive matmul results. This achieves 50-60% memory savings at only 10-15% extra compute.</p>
+
+      <h3>FlashAttention's Role</h3>
+
+      <p>FlashAttention (Chapter 37) eliminates the $O(n^2)$ memory footprint of the attention matrix by computing attention in tiled blocks within GPU SRAM, never materializing the full $n \times n$ matrix in HBM. This is orthogonal to activation checkpointing and stacks with it — together, they make 128K+ context training feasible on current hardware.</p>
+
+      <h3>Monitoring: MFU</h3>
+
+      <p><strong>Model FLOP Utilization</strong> (MFU) measures what fraction of a GPU cluster's theoretical peak compute is actually used for model computation:</p>
+
+      <div class="math-block">
+        $$\text{MFU} = \frac{6 \cdot N \cdot \text{tokens/sec}}{\text{num\_GPUs} \cdot P_{\text{peak}}}$$
+      </div>
+
+      <p>where the factor 6 comes from the $\approx 6N$ FLOPs per token for a model with $N$ parameters (2N forward + 4N backward), and $P_{\text{peak}}$ is the peak FLOPS of one GPU (989 TFLOPS for H100 BF16). Achieved MFU numbers: PaLM 540B on TPUv4 = 46.2%, Megatron-LM on H100 = 47-48%, MegaScale (ByteDance, 12,288 GPUs) = 55.2%, LLaMA 3 405B = ~40%. Anything above 35% is considered good; above 50% is excellent.</p>
+
+    </section>
+
+    <!-- ============================================================ -->
+    <!-- SECTION 6: CHINCHILLA-OPTIMAL DATA PLANNING                  -->
+    <!-- ============================================================ -->
+    <section class="chapter-section" id="chinchilla-data-planning">
+      <h2>Chinchilla-Optimal Data Planning</h2>
+
+      <p>Given a compute budget, how should you split it between model size and training data? Chapter 10 derived the Chinchilla scaling laws (Hoffmann et al., 2022). The headline result is that the compute-optimal token count scales linearly with model size:</p>
+
+      <div class="math-block">
+        $$D^* \approx 20N$$
+      </div>
+
+      <p>where $D^*$ is the optimal number of training tokens and $N$ is the parameter count (Chinchilla-optimal tokens, a dimensionless ratio). The total training compute is approximately $C \approx 6ND$ FLOPs (training compute estimate, where the factor 6 accounts for forward and backward passes). A 7B model is Chinchilla-optimal at 140B tokens; a 70B model at 1.4T tokens.</p>
+
+      <h3>Beyond Chinchilla: The Inference-Optimal Regime</h3>
+
+      <p>Chinchilla optimizes for training compute — but ignores inference cost. A model that will serve billions of requests over its lifetime should be <em>smaller and trained longer</em>, because each inference token is cheaper with a smaller model. This insight, formalized by Sardana and Frankle (ICML 2024), drove the dramatic overtraining in the LLaMA family:</p>
+
+      <table>
+        <thead>
+          <tr><th>Model</th><th>Parameters</th><th>Tokens</th><th>Tokens/Param</th><th>× Chinchilla</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>LLaMA 1 65B</td><td>65B</td><td>1.4T</td><td>~21</td><td>1.1×</td></tr>
+          <tr><td>LLaMA 2 70B</td><td>70B</td><td>2T</td><td>~29</td><td>1.4×</td></tr>
+          <tr><td>LLaMA 3 8B</td><td>8B</td><td>15T</td><td>~1,875</td><td>94×</td></tr>
+          <tr><td>LLaMA 3 405B</td><td>405B</td><td>15T</td><td>~37</td><td>1.9×</td></tr>
+        </tbody>
+      </table>
+
+      <p>Current best practice for high-deployment models: train 50-200× past Chinchilla-optimal. The quality improvement per additional token diminishes, but the inference cost savings compound over the model's lifetime.</p>
+
+      <h3>Data Epochs and Repetition</h3>
+
+      <p>When token budgets exceed available unique data, repetition becomes necessary. Empirically, a second pass over the data is noticeably worse than the first — loss curves flatten and downstream task gains diminish. Several strategies mitigate this: augmenting with synthetic data (e.g., code generation, paraphrasing), mixing in new domain-specific corpora, and carefully scheduling the repetition so that high-quality data is seen more often.</p>
+
+      <h3>Curriculum Learning</h3>
+
+      <p>Rather than presenting data randomly, curriculum learning orders examples from easy to hard — or, more commonly in LLM training, from general web data to higher-quality curated data. LLaMA 3 used a phased approach: the bulk of training used a broad web mixture, followed by an "annealing" phase on a smaller, curated dataset with higher code and math concentration. This late-stage data mix shift improved reasoning benchmarks significantly without degrading general capabilities.</p>
+
+      <figure class="diagram-figure diagram-interactive">
+        <div class="widget-container" id="widget-ch14-tokenbudget">
+          <style>
+            #widget-ch14-tokenbudget .controls {
+              display: flex; flex-wrap: wrap; gap: 1.2rem;
+              font-family: system-ui, -apple-system, sans-serif; font-size: 13px; color: #5C5B56;
+              padding: 0.5rem 0;
+            }
+            #widget-ch14-tokenbudget .controls label {
+              display: flex; align-items: center; gap: 8px;
+            }
+            #widget-ch14-tokenbudget .result-grid {
+              display: grid; grid-template-columns: 1fr 1fr; gap: 0.8rem; margin-top: 0.8rem;
+              font-family: system-ui, -apple-system, sans-serif; font-size: 13px;
+            }
+            #widget-ch14-tokenbudget .result-card {
+              padding: 0.7rem 1rem; border-radius: 6px; border: 1px solid #E5E3DC;
+            }
+            #widget-ch14-tokenbudget .result-label { font-size: 11px; color: #9C9A94; margin-bottom: 2px; }
+            #widget-ch14-tokenbudget .result-value { font-size: 18px; font-weight: 600; }
+          </style>
+
+          <div class="controls">
+            <label>
+              Model Size: <span id="ch14-model-display" style="font-weight:600; min-width:50px;">7B</span>
+              <input type="range" min="1" max="500" step="1" value="7"
+                style="width:200px; accent-color:#534AB7;"
+                oninput="updateCh14TokenBudget(this.value)">
+            </label>
+          </div>
+
+          <div class="result-grid">
+            <div class="result-card" style="background:#EEEDFE;">
+              <div class="result-label">Chinchilla-Optimal Tokens (20×N)</div>
+              <div class="result-value" style="color:#534AB7;" id="ch14-chinchilla">140B</div>
+            </div>
+            <div class="result-card" style="background:#E1F5EE;">
+              <div class="result-label">LLaMA-Style Overtrained (100×N)</div>
+              <div class="result-value" style="color:#0F6E56;" id="ch14-overtrained">700B</div>
+            </div>
+            <div class="result-card" style="background:#FAEEDA;">
+              <div class="result-label">Training FLOPs (C ≈ 6ND, Chinchilla)</div>
+              <div class="result-value" style="color:#854F0B;" id="ch14-flops">5.9e+21</div>
+            </div>
+            <div class="result-card" style="background:#FAECE7;">
+              <div class="result-label">Est. Training Time (1024 H100s, 50% MFU)</div>
+              <div class="result-value" style="color:#993C1D;" id="ch14-time">0.1 days</div>
+            </div>
+          </div>
+
+          <p style="font-family:system-ui; font-size:13px; color:#9C9A94; font-style:italic; padding:0.5rem 0 0;" id="ch14-observation">
+            A 7B model at Chinchilla-optimal requires 140B tokens — modest compute.
+          </p>
+        </div>
+
+        <script>
+          function updateCh14TokenBudget(val) {
+            var N = parseFloat(val);
+            var suffix = N >= 1 ? 'B' : 'M';
+            document.getElementById('ch14-model-display').textContent = N + 'B';
+
+            var chinTokens = 20 * N;
+            var overTokens = 100 * N;
+            var flops = 6 * N * 1e9 * chinTokens * 1e9;
+            var peakPerGPU = 989e12;
+            var numGPUs = 1024;
+            var mfu = 0.5;
+            var effectiveFlops = numGPUs * peakPerGPU * mfu;
+            var seconds = flops / effectiveFlops;
+            var days = seconds / 86400;
+
+            function fmtTokens(t) {
+              if (t >= 1000) return (t / 1000).toFixed(1) + 'T';
+              return t.toFixed(0) + 'B';
+            }
+            function fmtFlops(f) {
+              if (f >= 1e26) return (f / 1e26).toFixed(1) + 'e+26';
+              if (f >= 1e25) return (f / 1e25).toFixed(1) + 'e+25';
+              if (f >= 1e24) return (f / 1e24).toFixed(1) + 'e+24';
+              if (f >= 1e23) return (f / 1e23).toFixed(1) + 'e+23';
+              if (f >= 1e22) return (f / 1e22).toFixed(1) + 'e+22';
+              if (f >= 1e21) return (f / 1e21).toFixed(1) + 'e+21';
+              return f.toExponential(1);
+            }
+
+            document.getElementById('ch14-chinchilla').textContent = fmtTokens(chinTokens);
+            document.getElementById('ch14-overtrained').textContent = fmtTokens(overTokens);
+            document.getElementById('ch14-flops').textContent = fmtFlops(flops);
+            document.getElementById('ch14-time').textContent = days < 1 ? (days * 24).toFixed(1) + ' hours' : days.toFixed(1) + ' days';
+
+            var obs = '';
+            if (N <= 10) obs = 'A ' + N + 'B model is small enough to train on a single node. Overtraining to 100×N makes it competitive with larger models at inference.';
+            else if (N <= 70) obs = 'At ' + N + 'B, training requires multi-node clusters. Chinchilla-optimal is ' + fmtTokens(chinTokens) + ' tokens; modern practice trains 3-5× longer.';
+            else if (N <= 200) obs = 'A ' + N + 'B model requires thousands of GPUs and months of training. The compute cost grows as N² (more params × more tokens).';
+            else obs = 'At ' + N + 'B parameters, this is frontier-scale training. LLaMA 3 405B required 16,384 H100s. The compute budget is measured in millions of GPU-hours.';
+            document.getElementById('ch14-observation').textContent = obs;
+          }
+          updateCh14TokenBudget(7);
+        </script>
+        <figcaption>Figure 14.8 — Interactive: adjust model size to see how the token budget, training FLOPs, and estimated wall-clock time change. Chinchilla-optimal uses 20 tokens per parameter; modern practice overtrains by 5-100× for inference efficiency.</figcaption>
+      </figure>
+
+    </section>
+
+    <!-- ============================================================ -->
+    <!-- SECTION 7: TRAINING FAILURES AND RECOVERY                    -->
+    <!-- ============================================================ -->
+    <section class="chapter-section" id="training-failures-recovery">
+      <h2>Training Failures and Recovery</h2>
+
+      <p>At the scale of thousands of GPUs running for months, hardware failures are not exceptional events — they are the default operating condition. LLaMA 3 405B experienced 466 job interruptions over 54 days of training on 16,384 H100 GPUs. That is roughly one failure every three hours. Of these, 419 were unplanned: 35% GPU failures, 17% HBM3 memory errors, and the remainder a mix of network, host, and software issues. Despite this, Meta achieved over 90% effective training time with only 3 manual interventions — the rest was handled by automated detection and recovery.</p>
+
+      <h3>Loss Spikes</h3>
+
+      <p>Loss spikes — sudden, sharp increases in the training loss — are a persistent challenge in large-scale training. PaLM 540B experienced approximately 20 loss spike events. The standard mitigation is to roll back to a checkpoint taken ~100 steps before the spike, skip the 200-500 data batches that triggered it, and resume. The root cause is often never fully determined, though candidates include data quality issues, numerical instability in specific micro-batches, and rare hardware errors.</p>
+
+      <p>The following implements a simple spike detector that monitors the training loss.</p>
+
+<pre><code class="language-python">
+import torch
+from collections import deque
+
+class LossSpikeDetector:
+    """Detect and respond to loss spikes during large-scale training."""
+
+    def __init__(self, window_size=100, z_threshold=4.0):
+        self.window = deque(maxlen=window_size)
+        self.z_threshold = z_threshold
+        self.spike_count = 0
+
+    def update(self, loss_value: float, step: int) -> bool:
+        """Returns True if a spike is detected."""
+        if len(self.window) < 20:  # need enough history
+            self.window.append(loss_value)
+            return False
+
+        mean = sum(self.window) / len(self.window)
+        var = sum((x - mean) ** 2 for x in self.window) / len(self.window)
+        std = var ** 0.5 + 1e-8
+
+        z_score = (loss_value - mean) / std
+        is_spike = z_score > self.z_threshold
+
+        if is_spike:
+            self.spike_count += 1
+            print(f"[Step {step}] SPIKE DETECTED: loss={loss_value:.4f}, "
+                  f"mean={mean:.4f}, z={z_score:.1f} (spike #{self.spike_count})")
+        self.window.append(loss_value)
+        return is_spike
+
+# Usage in training loop:
+# detector = LossSpikeDetector(window_size=100, z_threshold=4.0)
+# if detector.update(loss.item(), step):
+#     load_checkpoint(step - 100)  # roll back
+#     skip_batches(200)            # skip suspect data
+</code></pre>
+
+      <h3>Checkpointing at Scale</h3>
+
+      <p>Checkpoint frequency is a balance: too rare and a failure wastes days of compute, too frequent and the I/O overhead slows training. BLOOM checkpointed every 3 hours (2.3TB per checkpoint across 384 GPUs). More recently, ByteDance's ByteRobust system demonstrated every-step checkpointing with less than 0.9% overhead by using asynchronous writes and memory-mapped files — essentially making checkpoint cost negligible.</p>
+
+      <h3>Silent Data Corruption</h3>
+
+      <div class="callout callout-warning">
+        <div class="callout-title">Silent Killers</div>
+        <p>Silent data corruption (SDC) — a GPU computes the wrong result without raising an error — is the most insidious failure mode in large-scale training. LLaMA 3 experienced 6 SDC-attributed interruptions in 54 days on 16,384 H100 GPUs. Google reported SDC events every 1-2 weeks during Gemini training. A single bitflip in a gradient can propagate through the optimizer state and permanently corrupt the model. Detection requires comparing activation checksums across redundant data-parallel replicas — an expensive operation that most frameworks skip by default.</p>
+      </div>
+
+      <h3>Straggler Mitigation</h3>
+
+      <p>In pipeline parallelism, the slowest stage determines the throughput of the entire pipeline. A straggler — a GPU running slower due to thermal throttling, network congestion, or degraded memory — can reduce cluster throughput by 10-20%. Mitigations include monitoring per-GPU step times, proactive node replacement when performance drops below a threshold, and redundant computation where critical stages run on backup GPUs that can take over instantly.</p>
+
+      <p>The engineering required to sustain >90% effective training time across tens of thousands of GPUs is arguably as challenging as the model architecture itself. For a comprehensive cross-domain treatment of distributed training — covering vision, audio, multimodal, and post-transformer architectures — see Chapter 44.</p>
+
+    </section>
+
+  </article>
+
+  <footer class="chapter-footer">
+    <div class="footer-nav">
+      <a href="ch13.html">← Previous: Retrieval and Ranking with Transformers</a>
+      <a href="ch15.html">Next: Evaluating Language Models →</a>
+    </div>
+  </footer>
+
+</body>
+</html>
