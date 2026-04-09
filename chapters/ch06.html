@@ -76,7 +76,7 @@
         $$\mathcal{L}_\text{CLM} = -\sum_{t=1}^{T} \log P(x_t \mid x_1, \ldots, x_{t-1})$$
       </div>
 
-      <p>Every token provides a training signal — CLM gets loss from 100% of tokens versus MLM's 15%. This makes CLM roughly 6-7× more sample-efficient in terms of gradient information per token processed. CLM also naturally supports generation: at inference time, the model simply continues predicting the next token. GPT, GPT-2, GPT-3, LLaMA, and nearly all modern large language models use CLM.</p>
+      <p>Every token provides a training signal — CLM gets loss from 100% of tokens versus MLM's 15%. In terms of <em>loss-bearing positions per forward pass</em>, that ratio is about $100/15 \approx 6.7\times$; both objectives still run attention over the full sequence, so this is not a claim about FLOPs or wall-clock efficiency. CLM also naturally supports generation: at inference time, the model simply continues predicting the next token. GPT, GPT-2, GPT-3, LLaMA, and nearly all modern large language models use CLM.</p>
 
       <p>A complete CLM forward pass in PyTorch shows how the shift-by-one alignment between inputs and targets implements next-token prediction.</p>
 
@@ -184,7 +184,7 @@ loss.backward()
           <text x="650" y="220" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#993C1D">100% of tokens</text>
           <text x="650" y="235" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#993C1D">provide loss signal</text>
         </svg>
-        <figcaption>Figure 6.1 — Masked Language Modeling vs Causal Language Modeling. MLM (top) masks 15% of tokens and predicts them using bidirectional context — only masked positions contribute to the loss. CLM (bottom) predicts every next token using only left context — all positions contribute to the loss, making it 6-7× more sample-efficient per token processed.</figcaption>
+        <figcaption>Figure 6.1 — Masked Language Modeling vs Causal Language Modeling. MLM (top) masks 15% of tokens and predicts them using bidirectional context — only masked positions contribute to the loss. CLM (bottom) predicts every next token using only left context — all positions contribute to the loss, so there are about 6-7× more loss terms per sequence than MLM's 15% mask (both still use a full forward pass over the sequence).</figcaption>
       </figure>
 
       <h3>Span Corruption</h3>
@@ -438,7 +438,9 @@ loss.backward()
         \end{aligned}$$
       </div>
 
-      <p>where $\hat{m}_t$ and $\hat{v}_t$ are bias-corrected moment estimates, $\eta$ is the learning rate, and $\lambda$ is the weight decay coefficient. Typical values: $\beta_1 = 0.9$, $\beta_2 = 0.95$, $\epsilon = 10^{-8}$, $\lambda = 0.1$.</p>
+      <p>where $\hat{m}_t$ and $\hat{v}_t$ are bias-corrected moment estimates, $\eta$ is the learning rate, and $\lambda$ is the weight decay coefficient. This is the decoupled update from Loshchilov and Hutter (2019): expanding the parentheses gives $\theta_t = \theta_{t-1} - \eta \hat{m}_t / (\sqrt{\hat{v}_t} + \epsilon) - \eta \lambda \theta_{t-1}$, i.e. weight decay is not folded into the adaptive denominator (unlike naive L2 inside Adam). <code>torch.optim.AdamW</code> implements this decoupled rule.</p>
+
+      <p>Typical values for <em>large LLM pre-training</em> (e.g. LLaMA-style recipes): $\beta_1 = 0.9$, $\beta_2 = 0.95$, $\epsilon = 10^{-8}$, $\lambda = 0.1$. Smaller encoder models such as BERT often use $\beta_2 = 0.999$ instead.</p>
 
       <h3>Learning Rate Schedules</h3>
 
@@ -446,7 +448,7 @@ loss.backward()
 
       <p><strong>Cosine decay with warmup</strong> is the most popular choice (LLaMA, PaLM, Gemini). The learning rate increases linearly during warmup (typically 1,000-2,000 steps), peaks at $\eta_\text{max}$ (e.g., $3 \times 10^{-4}$), then follows a cosine curve down to $\eta_\text{min}$ (typically $\eta_\text{max}/10$). The warmup phase prevents early instability: at initialization, the model's predictions are nearly random and gradients are noisy, so a large learning rate would push weights in unhelpful directions.</p>
 
-      <p><strong>Constant then decay</strong> holds the learning rate at $\eta_\text{max}$ for most of training, then decays (linearly or cosine) over the final 10-20% of steps. This simpler schedule performs comparably to full cosine decay in many settings and has a practical advantage: you can decide to extend training without needing to recompute the schedule. Chinchilla and some internal Google models have used this approach.</p>
+      <p><strong>Constant then decay</strong> holds the learning rate at $\eta_\text{max}$ for most of training, then decays (linearly or cosine) over the final 10-20% of steps. This simpler schedule performs comparably to full cosine decay in many settings and has a practical advantage: you can decide to extend training without needing to recompute the schedule. Hoffmann et al. (2022) (<em>Chinchilla</em>) used a <strong>cosine</strong> schedule (with warmup), not constant-then-decay; constant-then-decay appears in other large-scale runs and in later work on flexible schedules when the total step count may change.</p>
 
       <p><strong>Warmup-stable-decay (WSD)</strong> combines elements: warmup, then constant at peak, then rapid decay. This three-phase approach is gaining popularity because the constant phase is easy to reason about and the final decay phase can be tuned independently.</p>
 
@@ -604,6 +606,13 @@ for batch in dataloader:
 
       <figure class="diagram-figure">
         <svg width="100%" viewBox="0 0 800 220" xmlns="http://www.w3.org/2000/svg">
+          <defs>
+            <marker id="ch06-arr-spike" viewBox="0 0 10 10" refX="9" refY="5"
+              markerWidth="5" markerHeight="5" orient="auto-start-reverse">
+              <path d="M1 1L9 5L1 9" fill="none" stroke="context-stroke"
+                stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+            </marker>
+          </defs>
           <!-- Axes -->
           <line x1="80" y1="180" x2="740" y2="180" stroke="#C8C6BE" stroke-width="1"/>
           <line x1="80" y1="180" x2="80" y2="30" stroke="#C8C6BE" stroke-width="1"/>
@@ -616,7 +625,7 @@ for batch in dataloader:
 
           <!-- Spike annotations -->
           <circle cx="330" cy="60" r="4" fill="#993C1D"/>
-          <line x1="330" y1="46" x2="330" y2="38" stroke="#993C1D" stroke-width="1" marker-end="url(#ch06-arr2)"/>
+          <line x1="330" y1="46" x2="330" y2="38" stroke="#993C1D" stroke-width="1" marker-end="url(#ch06-arr-spike)"/>
           <text x="330" y="32" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="500" fill="#993C1D">loss spike</text>
 
           <circle cx="570" cy="45" r="4" fill="#993C1D"/>
@@ -676,7 +685,9 @@ def train_with_gradient_accumulation(model, dataloader, optimizer, scheduler,
 
       <h3>Checkpoint Strategy</h3>
 
-      <p>Checkpoints save the full training state: model weights, optimizer state (momentum buffers), learning rate scheduler state, data loader position, and random number generator states. A <strong>rolling checkpoint</strong> saves the most recent $k$ checkpoints and deletes older ones, limiting disk usage. <strong>Permanent checkpoints</strong> saved at regular intervals (every 1,000-5,000 steps) provide recovery points if a late-discovered issue requires re-training from an earlier state. For a 7B model, each checkpoint is about 28GB (14GB model + 14GB optimizer state), so a training run with 100 permanent checkpoints needs about 2.8TB of checkpoint storage.</p>
+      <p>Checkpoints save the full training state: model weights, optimizer state (momentum buffers), learning rate scheduler state, data loader position, and random number generator states. A <strong>rolling checkpoint</strong> saves the most recent $k$ checkpoints and deletes older ones, limiting disk usage. <strong>Permanent checkpoints</strong> saved at regular intervals (every 1,000-5,000 steps) provide recovery points if a late-discovered issue requires re-training from an earlier state.</p>
+
+      <p>Checkpoint size grows quickly: for a 7B-parameter model, bf16 weights alone are about $7 \times 10^9 \times 2$ bytes $\approx 14$ GB. Adam stores two fp32 moment tensors per parameter (first and second moments), which is about $2 \times 4 \times 7 \times 10^9 \approx 56$ GB — often <em>larger</em> than the weight tensor. A full training checkpoint (weights + optimizer + misc.) is commonly on the order of <strong>60–80 GB</strong> per save unless states are sharded or compressed; 100 such checkpoints can require <strong>6–8 TB</strong> before deduplication or pruning of old saves.</p>
 
       <h3>Resuming from Failure</h3>
 
