@@ -1,0 +1,898 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Chapter 26: Text-to-Speech and Voice Synthesis — Transformer Research Book</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <link rel="stylesheet" href="../assets/math.css">
+  <link rel="stylesheet" href="../assets/prism.css">
+  <!-- KaTeX for math rendering -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [
+        {left: '$$', right: '$$', display: true},
+        {left: '$', right: '$', display: false}
+      ]
+    })">
+  </script>
+  <!-- Prism for code blocks -->
+  <script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/prism.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-python.min.js"></script>
+</head>
+<body>
+  <nav class="chapter-nav">
+    <a href="../index.html" class="nav-home">← Table of Contents</a>
+    <span class="nav-chapter">Chapter 26</span>
+    <div style="display:flex; align-items:center; gap:1rem;">
+      <button class="theme-toggle" onclick="toggleTheme()" aria-label="Toggle dark mode">
+        <span class="icon-moon">&#9789;</span><span class="icon-sun">&#9788;</span>
+      </button>
+      <a href="ch27.html" class="nav-next">Next Chapter →</a>
+    </div>
+  </nav>
+  <script>
+    function toggleTheme() {
+      document.documentElement.classList.toggle('dark');
+      localStorage.setItem('theme', document.documentElement.classList.contains('dark') ? 'dark' : 'light');
+    }
+    if (localStorage.getItem('theme') === 'dark') document.documentElement.classList.add('dark');
+  </script>
+  <script src="../assets/progress.js"></script>
+
+  <article class="chapter">
+
+    <header class="chapter-header">
+      <div class="chapter-number">Chapter 26</div>
+      <h1 class="chapter-title">Text-to-Speech and Voice Synthesis</h1>
+      <p class="chapter-lead">In 2017 the state of the art in neural speech synthesis was Tacotron 2 feeding a WaveNet vocoder — a pipeline that produced eerily good audio for a single voice trained on twenty hours of studio recordings, but collapsed the moment you asked it to imitate a new speaker from a three-second clip. In 2026 a single 4-billion-parameter open-weight model from Mistral, and a 82-million-parameter indie model called Kokoro, and a closed-source model called Seed-TTS, all clone a voice from three seconds of reference audio with speaker similarity that human raters cannot distinguish from the original talker. By the end of this chapter you will understand how we got here: why neural audio codecs became the "vocabulary" of a new class of speech language models, why flow matching quietly displaced diffusion, why streaming TTS needed an entirely new framework called Delayed Streams Modeling, and how the zero-shot voice cloning frontier is now evaluated on a single benchmark called Seed-TTS Eval that measures three numbers — word error rate, speaker similarity, and a neural MOS predictor — and decides winners by a margin of tenths of a percent.</p>
+    </header>
+
+    <!-- ============================================================
+         SECTION 1: THREE ARCHITECTURAL FAMILIES
+         ============================================================ -->
+    <section class="chapter-section" id="three-families">
+      <h2>Three Architectural Families</h2>
+
+      <p>Modern zero-shot TTS is not a single architecture. It is three distinct families that have converged on the same outcome — cloning an arbitrary voice from a few seconds of reference audio — by very different routes. Understanding the field means understanding where each family shines, where each fails, and why practitioners pick one over another.</p>
+
+      <p>The <strong>autoregressive codec language model</strong> family treats speech exactly like text. A neural audio codec compresses a waveform into a stream of discrete tokens, and a decoder-only transformer is trained with next-token prediction over those tokens. Voice cloning falls out for free: prepend the reference audio's tokens as a prompt, append the target text, and let the model autoregressively generate continuation tokens. This is the VALL-E recipe, and its descendants include Spark-TTS, IndexTTS, Orpheus, Sesame CSM, and the autoregressive backbone of Voxtral.</p>
+
+      <p>The <strong>non-autoregressive flow matching</strong> family replaces next-token prediction with a continuous generative process. Instead of sampling tokens one at a time, the model learns a vector field that transports Gaussian noise to a clean mel spectrogram or continuous audio latent in a handful of ODE steps. There is no sequential decoding loop, so long-form stability is excellent and inference parallelizes across the whole utterance. VoiceBox, F5-TTS, MaskGCT, MegaTTS 3, Fox-TTS, and DiTTo-TTS all live here.</p>
+
+      <p>The <strong>hybrid two-stage</strong> family is what the frontier actually looks like in April 2026. An autoregressive decoder handles the slow, discrete, linguistically meaningful part of speech — the sequence of semantic tokens that encodes what is being said and roughly how it is being said. A non-autoregressive flow matching model then paints in the fast, continuous, high-frequency acoustic detail conditioned on those semantic tokens. CosyVoice 2, Seed-TTS, and Mistral's Voxtral TTS all use this split, and so far nobody has beaten it on both quality and latency at the same time.</p>
+
+      <figure class="diagram-figure">
+        <svg width="100%" viewBox="0 0 800 440" xmlns="http://www.w3.org/2000/svg">
+          <defs>
+            <marker id="ch26-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+              <path d="M1 1L9 5L1 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+            </marker>
+          </defs>
+
+          <text x="400" y="26" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="14" font-weight="600" fill="#1A1A18">The three families of zero-shot TTS</text>
+
+          <!-- Family A: AR codec LM -->
+          <rect x="20" y="50" width="240" height="360" rx="10" fill="none" stroke="#AFA9EC" stroke-width="1.5" stroke-dasharray="5 4"/>
+          <rect x="30" y="60" width="220" height="30" rx="5" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1"/>
+          <text x="140" y="80" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="13" font-weight="600" fill="#534AB7">A · Autoregressive codec LM</text>
+
+          <rect x="45" y="110" width="190" height="36" rx="5" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1"/>
+          <text x="140" y="133" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="500" fill="#0F6E56">text + reference audio</text>
+
+          <line x1="140" y1="146" x2="140" y2="164" stroke="#9C9A94" stroke-width="1.5" marker-end="url(#ch26-arr)"/>
+
+          <rect x="45" y="164" width="190" height="80" rx="5" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1.5"/>
+          <text x="140" y="190" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="500" fill="#534AB7">decoder-only transformer</text>
+          <text x="140" y="210" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#5C5B56">next-token prediction</text>
+          <text x="140" y="226" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#5C5B56">over codec tokens</text>
+
+          <line x1="140" y1="244" x2="140" y2="262" stroke="#9C9A94" stroke-width="1.5" marker-end="url(#ch26-arr)"/>
+
+          <rect x="45" y="262" width="190" height="36" rx="5" fill="#FAECE7" stroke="#F0997B" stroke-width="1"/>
+          <text x="140" y="285" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="500" fill="#993C1D">audio tokens → waveform</text>
+
+          <text x="140" y="325" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#5C5B56">VALL-E 2 · IndexTTS 2</text>
+          <text x="140" y="342" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#5C5B56">Orpheus · Spark-TTS · CSM</text>
+          <text x="140" y="372" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-style="italic" fill="#9C9A94">✓ low latency (streaming)</text>
+          <text x="140" y="388" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-style="italic" fill="#9C9A94">✗ word skipping / repetition</text>
+
+          <!-- Family B: Flow matching -->
+          <rect x="280" y="50" width="240" height="360" rx="10" fill="none" stroke="#5DCAA5" stroke-width="1.5" stroke-dasharray="5 4"/>
+          <rect x="290" y="60" width="220" height="30" rx="5" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1"/>
+          <text x="400" y="80" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="13" font-weight="600" fill="#0F6E56">B · Non-AR flow matching</text>
+
+          <rect x="305" y="110" width="190" height="36" rx="5" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1"/>
+          <text x="400" y="133" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="500" fill="#0F6E56">text + reference mel</text>
+
+          <line x1="400" y1="146" x2="400" y2="164" stroke="#9C9A94" stroke-width="1.5" marker-end="url(#ch26-arr)"/>
+
+          <rect x="305" y="164" width="190" height="80" rx="5" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1.5"/>
+          <text x="400" y="190" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="500" fill="#534AB7">Diffusion Transformer (DiT)</text>
+          <text x="400" y="210" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#5C5B56">velocity field v_θ(x, t)</text>
+          <text x="400" y="226" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#5C5B56">noise → mel in ~8 ODE steps</text>
+
+          <line x1="400" y1="244" x2="400" y2="262" stroke="#9C9A94" stroke-width="1.5" marker-end="url(#ch26-arr)"/>
+
+          <rect x="305" y="262" width="190" height="36" rx="5" fill="#FAECE7" stroke="#F0997B" stroke-width="1"/>
+          <text x="400" y="285" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="500" fill="#993C1D">mel → waveform (vocoder)</text>
+
+          <text x="400" y="325" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#5C5B56">VoiceBox · F5-TTS · MaskGCT</text>
+          <text x="400" y="342" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#5C5B56">MegaTTS 3 · Fox-TTS · DiTTo</text>
+          <text x="400" y="372" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-style="italic" fill="#9C9A94">✓ stable long-form output</text>
+          <text x="400" y="388" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-style="italic" fill="#9C9A94">✗ hard to stream end-to-end</text>
+
+          <!-- Family C: Hybrid -->
+          <rect x="540" y="50" width="240" height="360" rx="10" fill="none" stroke="#EF9F27" stroke-width="1.5" stroke-dasharray="5 4"/>
+          <rect x="550" y="60" width="220" height="30" rx="5" fill="#FAEEDA" stroke="#EF9F27" stroke-width="1"/>
+          <text x="660" y="80" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="13" font-weight="600" fill="#854F0B">C · Hybrid two-stage</text>
+
+          <rect x="565" y="110" width="190" height="36" rx="5" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1"/>
+          <text x="660" y="133" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="500" fill="#0F6E56">text + reference audio</text>
+
+          <line x1="660" y1="146" x2="660" y2="164" stroke="#9C9A94" stroke-width="1.5" marker-end="url(#ch26-arr)"/>
+
+          <rect x="565" y="164" width="190" height="38" rx="5" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1.5"/>
+          <text x="660" y="182" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="500" fill="#534AB7">AR decoder → semantic</text>
+          <text x="660" y="196" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#5C5B56">tokens (what + how)</text>
+
+          <line x1="660" y1="202" x2="660" y2="218" stroke="#9C9A94" stroke-width="1.5" marker-end="url(#ch26-arr)"/>
+
+          <rect x="565" y="218" width="190" height="38" rx="5" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1.5"/>
+          <text x="660" y="236" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="500" fill="#0F6E56">Flow matching → acoustic</text>
+          <text x="660" y="250" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#5C5B56">tokens (timbre + detail)</text>
+
+          <line x1="660" y1="256" x2="660" y2="272" stroke="#9C9A94" stroke-width="1.5" marker-end="url(#ch26-arr)"/>
+
+          <rect x="565" y="272" width="190" height="26" rx="5" fill="#FAECE7" stroke="#F0997B" stroke-width="1"/>
+          <text x="660" y="290" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="500" fill="#993C1D">codec → waveform</text>
+
+          <text x="660" y="325" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#5C5B56">CosyVoice 2 · Seed-TTS</text>
+          <text x="660" y="342" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#5C5B56">Voxtral TTS (Mistral)</text>
+          <text x="660" y="372" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-style="italic" fill="#9C9A94">✓ best of both worlds</text>
+          <text x="660" y="388" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-style="italic" fill="#9C9A94">✓ current frontier</text>
+        </svg>
+        <figcaption>Figure 26.1 — The three families of zero-shot TTS circa April 2026. Autoregressive codec LMs stream well but can skip or repeat words. Flow matching models are stable on long utterances but traditionally batch-decode the whole utterance. Hybrid two-stage systems use an AR decoder for semantic structure and a flow matching module for acoustic detail, and currently rank among the strongest systems on Seed-TTS Eval and latency-sensitive deployments.</figcaption>
+      </figure>
+
+      <h3>When to pick which family</h3>
+
+      <p>Practitioners boil the decision down to three axes. <strong>Latency and streaming</strong> favor autoregressive codec LMs: they emit tokens left-to-right, so time-to-first-audio can track an upstream LLM token stream with frameworks like Delayed Streams Modeling. <strong>Stability on long utterances</strong> favors non-autoregressive flow matching and masked codec transformers: the whole mel or codec grid is refined jointly, which avoids the drift and misalignment that plague long AR samples. <strong>Controllability at the frontier</strong> favors hybrid two-stage systems: semantic tokens give a handle on what is said and roughly how long it lasts, while a flow head or second stage preserves timbre and emotion without forcing everything through a single AR chain.</p>
+
+      <p>Before we dive into any of these, we need to understand the thing they all share — the neural audio codec that turns waveforms into a fixed-vocabulary sequence of tokens. The codec is not an implementation detail. It is the core abstraction that made codec language models possible in the first place, and its frame rate, bitrate, and semantic content bound everything downstream. The recent shift to low-frame-rate codecs with semantic tokens in the first codebook is the single most important architectural change in TTS since transformers arrived.</p>
+    </section>
+
+    <!-- ============================================================
+         SECTION 2: NEURAL AUDIO CODECS
+         ============================================================ -->
+    <section class="chapter-section" id="neural-audio-codecs">
+      <h2>Neural Audio Codecs: The Vocabulary of Speech LMs</h2>
+
+      <p>A decoder-only transformer predicts tokens from a finite vocabulary. Text gives you that vocabulary for free — thirty thousand BPE pieces, nothing more to think about. Audio does not. A 24 kHz waveform is a stream of 24 000 continuous floats per second, and there is no natural way to carve that into discrete tokens that a softmax can predict. The entire codec LM paradigm is built on the observation that we can train an autoencoder whose bottleneck is a discrete sequence, and then treat that sequence as the "words" of speech.</p>
+
+      <h3>Residual vector quantization in one picture</h3>
+
+      <p>The trick that made neural audio codecs practical is <strong>residual vector quantization</strong> (RVQ). A naive vector quantizer maps each latent frame to its nearest entry in a codebook of, say, 1024 vectors — that is 10 bits of information per frame, which is nowhere near enough to reconstruct a high-fidelity waveform. RVQ solves this by stacking quantizers: the first codebook captures the coarsest structure, the second codebook quantizes the residual left over, the third codebook quantizes the residual of that, and so on. With eight codebooks of 1024 entries each, every frame is described by 80 bits, enough for near-transparent reconstruction of the original audio.</p>
+
+      <figure class="diagram-figure">
+        <svg width="100%" viewBox="0 0 800 320" xmlns="http://www.w3.org/2000/svg">
+          <defs>
+            <marker id="ch26-arr2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
+              <path d="M1 1L9 5L1 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+            </marker>
+          </defs>
+
+          <text x="400" y="26" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="14" font-weight="600" fill="#1A1A18">Residual vector quantization — one frame at a time</text>
+
+          <!-- Input latent -->
+          <rect x="40" y="70" width="100" height="50" rx="6" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1.5"/>
+          <text x="90" y="93" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="500" fill="#0F6E56">encoder</text>
+          <text x="90" y="108" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#5C5B56">latent z ∈ ℝ^d</text>
+
+          <!-- Q1 -->
+          <line x1="140" y1="95" x2="170" y2="95" stroke="#9C9A94" stroke-width="1.5" marker-end="url(#ch26-arr2)"/>
+
+          <rect x="170" y="70" width="90" height="50" rx="6" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1.5"/>
+          <text x="215" y="90" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="500" fill="#534AB7">Q₁</text>
+          <text x="215" y="105" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#5C5B56">code c₁</text>
+
+          <!-- r1 = z - Q1(z) -->
+          <line x1="260" y1="95" x2="290" y2="95" stroke="#9C9A94" stroke-width="1.5" marker-end="url(#ch26-arr2)"/>
+          <text x="275" y="80" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#9C9A94">r₁</text>
+
+          <rect x="290" y="70" width="90" height="50" rx="6" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1.5"/>
+          <text x="335" y="90" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="500" fill="#534AB7">Q₂</text>
+          <text x="335" y="105" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#5C5B56">code c₂</text>
+
+          <line x1="380" y1="95" x2="410" y2="95" stroke="#9C9A94" stroke-width="1.5" marker-end="url(#ch26-arr2)"/>
+          <text x="395" y="80" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#9C9A94">r₂</text>
+
+          <rect x="410" y="70" width="90" height="50" rx="6" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1.5"/>
+          <text x="455" y="90" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="500" fill="#534AB7">Q₃</text>
+          <text x="455" y="105" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#5C5B56">code c₃</text>
+
+          <line x1="500" y1="95" x2="530" y2="95" stroke="#9C9A94" stroke-width="1.5" marker-end="url(#ch26-arr2)" stroke-dasharray="4 3"/>
+          <text x="545" y="98" font-family="system-ui, -apple-system, sans-serif" font-size="13" font-weight="400" fill="#9C9A94">…</text>
+
+          <rect x="580" y="70" width="90" height="50" rx="6" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1.5"/>
+          <text x="625" y="90" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="500" fill="#534AB7">Q_K</text>
+          <text x="625" y="105" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#5C5B56">code c_K</text>
+
+          <!-- Output tokens -->
+          <rect x="700" y="70" width="70" height="50" rx="6" fill="#FAECE7" stroke="#F0997B" stroke-width="1.5"/>
+          <text x="735" y="93" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#993C1D">K tokens</text>
+          <text x="735" y="108" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#5C5B56">per frame</text>
+
+          <!-- Explanation row -->
+          <rect x="40" y="170" width="720" height="50" rx="8" fill="#F1EFE8" stroke="#C8C6BE" stroke-width="1"/>
+          <text x="60" y="192" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="500" fill="#5C5B56">Q₁ — coarsest structure (phoneme-scale information)</text>
+          <text x="60" y="210" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="500" fill="#5C5B56">Q₂ … Q_K — finer acoustic detail (timbre, breathiness, reverb) of decreasing magnitude</text>
+
+          <!-- Annotation -->
+          <rect x="40" y="240" width="720" height="50" rx="8" fill="#FAEEDA" stroke="#EF9F27" stroke-width="1"/>
+          <text x="400" y="262" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="500" fill="#854F0B">Reconstruction: ẑ = Q₁(z) + Q₂(r₁) + Q₃(r₂) + … + Q_K(r_{K-1})</text>
+          <text x="400" y="278" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-style="italic" fill="#5C5B56">each residual r_k = r_{k-1} − Q_k(r_{k-1})</text>
+        </svg>
+        <figcaption>Figure 26.2 — Residual vector quantization. Each frame of the encoder output is quantized by a cascade of codebooks, where codebook k+1 quantizes the residual error left by codebook k. The first codebook captures the coarsest structure (roughly the phoneme), and successive codebooks refine increasingly fine acoustic detail. An AR speech LM typically only predicts the first codebook autoregressively and delegates the remaining codebooks to a smaller non-autoregressive model.</figcaption>
+      </figure>
+
+      <p>The reconstruction sum is:</p>
+
+      $$\hat{z} = \sum_{k=1}^{K} Q_k(r_{k-1}), \quad r_0 = z, \quad r_k = r_{k-1} - Q_k(r_{k-1})$$
+
+      <p>Here $z$ is the encoder's continuous latent for one frame, $Q_k$ is the $k$-th quantizer (a nearest-neighbor lookup into its codebook), and $r_k$ is the residual that remains after quantizing with the first $k$ codebooks. The sum is ordered juxtaposition of additive terms where each $Q_k(r_{k-1})$ is a vector in $\mathbb{R}^d$ — this is vector addition, not matrix multiplication, so there is no ambiguity about the operation type.</p>
+
+      <h3>The evolution of codecs</h3>
+
+      <p>The history of neural audio codecs is a history of trading bitrate for intelligibility and of fusing semantics into the first codebook. <strong>EnCodec</strong> (Meta, 2023) was the baseline: pure acoustic RVQ at 75 Hz, 8 codebooks, 6 kbps. <strong>DAC</strong> (Kumar et al., 2023) pushed this to 24 kHz with better rate-distortion. <strong>SNAC</strong> (2024) introduced a multi-scale structure where coarse codebooks operate at a lower frame rate than fine codebooks, mirroring the fact that semantic content changes slowly while texture changes quickly.</p>
+
+      <p>The next breakthrough was semantic distillation. A pure acoustic codec has no notion of language — its first codebook encodes whatever direction in latent space happens to have the largest variance, which is typically pitch contour or loudness envelope. <strong>X-Codec</strong> (Ye et al., AAAI 2025) and <strong>DualCodec</strong> (2025) explicitly address this by fusing self-supervised speech features (e.g., from WavLM or wav2vec 2.0) into the first RVQ layer so that codebook 1 carries linguistic content, not just energy. <strong>Mimi</strong> (Kyutai, 2024) applies the same idea in a streaming-friendly codec: semantic information is distilled into the first codebook during training. The effect is dramatic: the first codebook now carries phoneme-level information, so an AR speech LM trained on codec tokens is effectively doing something close to next-phoneme prediction, and cross-modal alignment with text becomes much easier.</p>
+
+      <p>Mimi in particular is the codec to know. It runs at 12.5 Hz — a six-fold reduction from EnCodec — with 1.1 kbps, 80 ms end-to-end latency, and fully streaming encode/decode. The 12.5 Hz frame rate is the critical number: for an autoregressive model, doubling the frame rate doubles the number of tokens you have to generate, so halving it halves the cost. Voxtral's codec went one step further and packs 37 tokens per frame at 12.5 Hz (1 semantic + 36 acoustic), producing 2.14 kbps of total bitrate that reconstructs near-transparent 24 kHz audio.</p>
+
+      <figure class="diagram-figure">
+        <svg width="100%" viewBox="0 0 800 340" xmlns="http://www.w3.org/2000/svg">
+          <text x="400" y="26" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="14" font-weight="600" fill="#1A1A18">The low-frame-rate, semantic-first codec trend</text>
+
+          <!-- Axes -->
+          <line x1="100" y1="280" x2="760" y2="280" stroke="#C8C6BE" stroke-width="1.5"/>
+          <line x1="100" y1="80" x2="100" y2="280" stroke="#C8C6BE" stroke-width="1.5"/>
+
+          <text x="430" y="310" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="500" fill="#5C5B56">Frame rate (Hz) — lower is better for AR LMs</text>
+          <text x="70" y="180" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="500" fill="#5C5B56" transform="rotate(-90 70 180)">Semantic content in codebook 1</text>
+
+          <!-- X ticks -->
+          <text x="150" y="295" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#9C9A94">75 Hz</text>
+          <text x="300" y="295" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#9C9A94">50 Hz</text>
+          <text x="500" y="295" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#9C9A94">25 Hz</text>
+          <text x="720" y="295" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#9C9A94">12.5 Hz</text>
+
+          <!-- EnCodec -->
+          <circle cx="150" cy="250" r="8" fill="#B4B2A9" stroke="#5C5B56" stroke-width="1.5"/>
+          <text x="150" y="230" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="500" fill="#5C5B56">EnCodec</text>
+          <text x="150" y="215" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#9C9A94">2023</text>
+
+          <!-- DAC -->
+          <circle cx="200" cy="235" r="8" fill="#B4B2A9" stroke="#5C5B56" stroke-width="1.5"/>
+          <text x="200" y="260" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="500" fill="#5C5B56">DAC</text>
+
+          <!-- SNAC -->
+          <circle cx="310" cy="200" r="8" fill="#EF9F27" stroke="#854F0B" stroke-width="1.5"/>
+          <text x="310" y="180" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="500" fill="#854F0B">SNAC</text>
+          <text x="310" y="165" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#9C9A94">multi-scale</text>
+
+          <!-- X-Codec -->
+          <circle cx="400" cy="140" r="8" fill="#F0997B" stroke="#993C1D" stroke-width="1.5"/>
+          <text x="400" y="120" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="500" fill="#993C1D">X-Codec</text>
+          <text x="400" y="105" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#9C9A94">SSL-distilled</text>
+
+          <!-- DualCodec -->
+          <circle cx="570" cy="125" r="8" fill="#F0997B" stroke="#993C1D" stroke-width="1.5"/>
+          <text x="570" y="145" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="500" fill="#993C1D">DualCodec</text>
+
+          <!-- Mimi -->
+          <circle cx="720" cy="110" r="10" fill="#534AB7" stroke="#534AB7" stroke-width="1.5"/>
+          <text x="720" y="90" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="600" fill="#534AB7">Mimi</text>
+          <text x="720" y="75" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#9C9A94">Kyutai 2024</text>
+
+          <!-- Voxtral codec -->
+          <circle cx="720" cy="140" r="10" fill="#534AB7" stroke="#534AB7" stroke-width="1.5"/>
+          <text x="720" y="162" text-anchor="start" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="600" fill="#534AB7" transform="translate(-85 0)">Voxtral codec</text>
+
+          <!-- Arrow of progress -->
+          <path d="M 170 248 Q 300 200, 720 115" fill="none" stroke="#534AB7" stroke-width="2" stroke-dasharray="6 4" opacity="0.6"/>
+          <text x="430" y="195" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" font-style="italic" fill="#534AB7">direction of progress</text>
+        </svg>
+        <figcaption>Figure 26.3 — The two-year trajectory of neural audio codecs. Frame rate dropped from 75 Hz (EnCodec) to 12.5 Hz (Mimi, Voxtral codec), shrinking the token budget that an AR decoder has to generate. At the same time, semantic content was progressively fused into the first codebook through SSL distillation or explicit semantic+acoustic factorization, turning the first codec token into something close to a phoneme.</figcaption>
+      </figure>
+
+      <h3>Loading a codec in code</h3>
+
+      <p>Here is the smallest practical snippet for encoding a waveform with Meta's EnCodec — the codec that started the entire codec LM era. We use HuggingFace <code>datasets</code> only to load a sample audio clip, and the codec itself is run through pure PyTorch using the encodec package.</p>
+
+<pre><code class="language-python">import torch
+from encodec import EncodecModel
+from encodec.utils import convert_audio
+from datasets import load_dataset
+
+# Load a real sample from LibriSpeech (data loading only, not modelling)
+ds = load_dataset("openslr/librispeech_asr", "clean", split="test[:1]", trust_remote_code=True)
+wav = torch.tensor(ds[0]["audio"]["array"]).float().unsqueeze(0)  # (1, T)
+sr  = ds[0]["audio"]["sampling_rate"]
+
+# Load the 24 kHz, 6 kbps EnCodec model in pure PyTorch
+model = EncodecModel.encodec_model_24khz()
+model.set_target_bandwidth(6.0)  # 8 codebooks
+wav = convert_audio(wav, sr, model.sample_rate, model.channels)  # resample to 24 kHz
+wav = wav.unsqueeze(0)  # (B=1, C=1, T)
+
+# Encode → list of (codes, scale) per chunk; concatenate codes across chunks
+with torch.no_grad():
+    encoded = model.encode(wav)
+codes = torch.cat([c for c, _ in encoded], dim=-1)  # (B, K=8, N_frames)
+
+print("codes shape:", codes.shape)          # e.g. (1, 8, 750) for a 10 s clip
+print("frame rate:", model.frame_rate)      # 75 Hz for EnCodec 24 kHz
+print("codebook size:", model.quantizer.bins)  # 1024
+
+# Decode back to waveform
+with torch.no_grad():
+    recon = model.decode(encoded)[0]  # (1, T)
+</code></pre>
+
+      <p>The key numbers to notice: <code>codes.shape</code> is <code>(B, 8, N_frames)</code>, meaning eight parallel streams of discrete tokens. A codec language model has to decide how to order these streams. VALL-E predicts the first stream autoregressively and the remaining seven with a non-autoregressive "residual" model. MaskGCT predicts all streams with parallel masked-language modeling. Voxtral predicts the single semantic token autoregressively and the 36 acoustic tokens with a separate flow matching head. The codec defines the shape of the tensor, and the LM architecture picks the factorization.</p>
+    </section>
+
+    <!-- ============================================================
+         SECTION 3: VALL-E AND THE CODEC LM PARADIGM
+         ============================================================ -->
+    <section class="chapter-section" id="vall-e-codec-lm">
+      <h2>VALL-E and the Codec LM Paradigm</h2>
+
+      <p>VALL-E (Wang et al., 2023) was the paper that convinced the field to treat speech synthesis as language modeling. Before VALL-E, zero-shot voice cloning meant training a speaker encoder that produced a fixed-length embedding and then conditioning a Tacotron-style decoder on that embedding. This worked tolerably for voices similar to the training distribution but fell apart on out-of-distribution speakers. VALL-E did something different — and conceptually obvious in hindsight — by reframing cloning as in-context learning.</p>
+
+      <p>The setup is simple. Take three seconds of reference audio from the target speaker and encode it with EnCodec to get a sequence of codec tokens. Take the phoneme sequence for both the reference text and the new text you want synthesized. Concatenate: <em>reference phonemes + target phonemes + reference audio tokens + <code>&lt;BOS&gt;</code></em>. Ask the decoder-only transformer to autoregressively generate continuation tokens, and decode those tokens through EnCodec back to a waveform. The speaker identity is baked into the reference audio, and the model learns during pretraining that it should continue in the same voice.</p>
+
+      <figure class="diagram-figure">
+        <svg width="100%" viewBox="0 0 800 320" xmlns="http://www.w3.org/2000/svg">
+          <defs>
+            <marker id="ch26-arr3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
+              <path d="M1 1L9 5L1 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+            </marker>
+          </defs>
+
+          <text x="400" y="26" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="14" font-weight="600" fill="#1A1A18">VALL-E: zero-shot cloning as in-context completion</text>
+
+          <!-- The prompt row -->
+          <text x="20" y="72" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="500" fill="#5C5B56">Context (prompt):</text>
+
+          <rect x="150" y="55" width="130" height="36" rx="5" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1.5"/>
+          <text x="215" y="78" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="500" fill="#0F6E56">ref phonemes</text>
+
+          <rect x="285" y="55" width="130" height="36" rx="5" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1.5"/>
+          <text x="350" y="78" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="500" fill="#0F6E56">target phonemes</text>
+
+          <rect x="420" y="55" width="160" height="36" rx="5" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1.5"/>
+          <text x="500" y="78" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="500" fill="#534AB7">ref audio tokens (3 s)</text>
+
+          <rect x="585" y="55" width="50" height="36" rx="5" fill="#FFFFFF" stroke="#C8C6BE" stroke-width="1"/>
+          <text x="610" y="78" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="500" fill="#9C9A94">&lt;BOS&gt;</text>
+
+          <line x1="400" y1="100" x2="400" y2="120" stroke="#9C9A94" stroke-width="1.5" marker-end="url(#ch26-arr3)"/>
+
+          <!-- AR transformer -->
+          <rect x="140" y="120" width="520" height="50" rx="6" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1.5"/>
+          <text x="400" y="143" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="13" font-weight="500" fill="#534AB7">AR decoder-only transformer — predicts codebook 1 one token at a time</text>
+          <text x="400" y="160" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#9C9A94">p(c₁,ₜ | c₁,₁:ₜ₋₁, phonemes, ref audio)</text>
+
+          <line x1="400" y1="170" x2="400" y2="190" stroke="#9C9A94" stroke-width="1.5" marker-end="url(#ch26-arr3)"/>
+
+          <!-- NAR transformer -->
+          <rect x="140" y="190" width="520" height="50" rx="6" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1.5"/>
+          <text x="400" y="213" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="13" font-weight="500" fill="#534AB7">NAR transformer — predicts codebooks 2 … 8 in parallel</text>
+          <text x="400" y="230" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#9C9A94">p(cₖ,ₜ | c₁:ₖ₋₁,ₜ, phonemes, ref audio)   for k = 2, …, 8</text>
+
+          <line x1="400" y1="240" x2="400" y2="258" stroke="#9C9A94" stroke-width="1.5" marker-end="url(#ch26-arr3)"/>
+
+          <rect x="220" y="258" width="360" height="36" rx="5" fill="#FAECE7" stroke="#F0997B" stroke-width="1.5"/>
+          <text x="400" y="281" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="500" fill="#993C1D">EnCodec decoder → waveform (target voice)</text>
+        </svg>
+        <figcaption>Figure 26.4 — VALL-E factorizes codec token prediction into two stages. An autoregressive decoder predicts the first codebook (the coarsest, most phonetic stream) one token at a time, conditioned on phonemes and the reference audio's tokens. A separate non-autoregressive transformer then fills in codebooks 2–8 in parallel, conditioned on all previously generated codebooks. This two-stage design keeps AR sequence length manageable (only 1/8 of the tokens) while still producing high-bitrate audio.</figcaption>
+      </figure>
+
+      <p>Mathematically, the AR model optimizes the standard next-token likelihood on the first codebook $c_{1,t}$, conditioned on the phoneme sequence $\phi$ and the reference audio tokens $\tilde{c}$:</p>
+
+      $$p(c_{1,1:T} \mid \phi, \tilde{c}) = \prod_{t=1}^{T} p_\theta(c_{1,t} \mid c_{1,1:t-1},\, \phi,\, \tilde{c})$$
+
+      <p>Here the product is ordinary scalar multiplication of probabilities — $\prod$ of scalars — and juxtaposition in the inner arguments (like $c_{1,1:t-1}\, \phi$) is sequence concatenation, not multiplication. The non-autoregressive model then optimizes an analogous likelihood for each higher codebook $k$ conditioned on all previously predicted codebooks at the same timestep:</p>
+
+      $$p(c_{k,1:T} \mid c_{1:k-1,1:T}, \phi, \tilde{c}) = \prod_{t=1}^{T} p_\theta(c_{k,t} \mid c_{1:k-1,t}, \phi, \tilde{c})$$
+
+      <p>The critical observation: the NAR model predicts codebook $k$ for every timestep $t$ in parallel, because each prediction depends only on lower codebooks at the same timestep, not on other timesteps of the same codebook. That is how VALL-E gets away with running a transformer only seven times (once per residual codebook) regardless of utterance length.</p>
+
+      <h3>VALL-E 2 and human parity</h3>
+
+      <p>The original VALL-E had two infuriating failure modes. It occasionally skipped words during long utterances, and it would sometimes get stuck in a loop repeating the same short phrase. Both are symptoms of the same underlying problem: autoregressive sampling over codec tokens has no explicit alignment constraint between phonemes and audio frames, so the model can drift off the text. <strong>VALL-E 2</strong> (Microsoft, 2024) fixed both with two ideas. First, <strong>repetition-aware sampling</strong>: at each decoding step, check whether the top-1 candidate would produce a span identical to the previous few tokens, and if so fall back to nucleus sampling. This is a minor algorithmic patch but it eliminates the loop failure mode essentially completely. Second, <strong>grouped code modeling</strong>: instead of predicting one token per step, predict a group of $G$ consecutive tokens per step, shrinking the effective sequence length by a factor of $G$ and reducing error accumulation. With these two changes, VALL-E 2 became the first zero-shot TTS system to match human speakers on LibriSpeech and VCTK in both naturalness and speaker similarity.</p>
+
+      <h3>VALL-E R, VALL-E X, and remaining failure modes</h3>
+
+      <p>The follow-on work <strong>VALL-E R</strong> and <strong>VALL-E X</strong> target robustness and multilingual use. VALL-E R emphasizes monotonic alignment between text and audio so that decoding stays tied to the prompt under stress (long prompts, noisy references). VALL-E X extends the codec-LM recipe to cross-lingual synthesis — cloning the speaker while transferring to another language — using the same discrete-token backbone with adapted training and data. Even with those improvements, AR codec LMs still show failure modes: <strong>word skipping</strong> and <strong>repetition loops</strong> when sampling goes off-manifold, and <strong>attention collapse</strong> on very long prompts or unusual enrollment audio, where the model produces slurred or run-on speech because the alignment between phoneme conditioning and the audio stream weakens.</p>
+
+      <h3>A toy codec LM forward pass</h3>
+
+      <p>Here is the cleanest possible pure-PyTorch sketch of a VALL-E-style AR decoder over codec tokens. This is a toy implementation meant to show the shape of the tensor flow, not a production model — but every line corresponds to something you would also write in a real codec LM.</p>
+
+<pre><code class="language-python">import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class ValleARDecoder(nn.Module):
+    """Tiny decoder-only transformer over codebook-1 tokens, conditioned on phonemes."""
+    def __init__(self, n_phonemes=256, n_codes=1024, d_model=512, n_layers=12, n_heads=8):
+        super().__init__()
+        self.phoneme_emb = nn.Embedding(n_phonemes, d_model)
+        self.code_emb    = nn.Embedding(n_codes + 2, d_model)  # +2 for BOS/EOS
+        self.pos_emb     = nn.Embedding(4096, d_model)
+        layer = nn.TransformerEncoderLayer(d_model, n_heads, 4*d_model,
+                                           batch_first=True, norm_first=True)
+        self.blocks = nn.TransformerEncoder(layer, n_layers)
+        self.head   = nn.Linear(d_model, n_codes + 2)
+
+    def forward(self, phonemes, codes):
+        # phonemes: (B, L_p)     — target phoneme IDs (prompt)
+        # codes:    (B, L_c)     — codebook-1 token IDs for ref + target audio
+        B = phonemes.size(0)
+        p = self.phoneme_emb(phonemes)                             # (B, L_p, d)
+        c = self.code_emb(codes)                                   # (B, L_c, d)
+        x = torch.cat([p, c], dim=1)                               # (B, L_p+L_c, d)
+        pos = torch.arange(x.size(1), device=x.device)
+        x = x + self.pos_emb(pos)[None]                            # broadcast pos
+
+        # Causal mask — phonemes can see each other, audio only sees past audio+all phonemes
+        L = x.size(1)
+        mask = torch.triu(torch.full((L, L), float('-inf'), device=x.device), diagonal=1)
+        h = self.blocks(x, mask=mask)                              # (B, L, d)
+
+        # Predict next code only at audio positions
+        logits = self.head(h[:, phonemes.size(1):])                # (B, L_c, n_codes+2)
+        return logits
+
+# Shape sanity check (batch=2, 40 phonemes, 200 code tokens = ~2.6s of Mimi audio)
+m = ValleARDecoder()
+ph   = torch.randint(0, 256, (2, 40))
+codes = torch.randint(0, 1024, (2, 200))
+print(m(ph, codes).shape)   # → torch.Size([2, 200, 1026])
+</code></pre>
+
+      <p>Three details matter. The phonemes and audio tokens share the same residual stream and the same positional embedding, so the transformer can attend between them with no special cross-attention machinery — this is the key architectural simplicity of codec LMs compared to encoder-decoder Tacotron-era models. The causal mask is upper-triangular over the entire concatenated sequence, so audio tokens can attend back to earlier audio tokens and to every phoneme, but not to future audio. And the final head only produces logits at audio positions because that is the only place you need to sample codec tokens.</p>
+    </section>
+
+    <!-- ============================================================
+         SECTION 4: FLOW MATCHING
+         ============================================================ -->
+    <section class="chapter-section" id="flow-matching">
+      <h2>Flow Matching and Diffusion Transformers for Speech</h2>
+
+      <p>Autoregressive codec LMs are powerful, but they have a ceiling. Word skipping, repetition, and long-form drift are all symptoms of the same disease — sampling tokens sequentially accumulates error, and there is no mechanism in the model to realign. The fix that took over in 2024 was to give up on next-token prediction entirely and use a continuous generative model that produces the whole mel spectrogram in parallel.</p>
+
+      <h3>Flow matching in one paragraph</h3>
+
+      <p>Flow matching learns a time-dependent velocity field $v_\theta(x, t)$ whose integral from $t=0$ to $t=1$ transports a sample from a simple base distribution $p_0$ (standard Gaussian) to a sample from the data distribution $p_1$ (clean mel spectrogram). Training is trivial: pick a random $t \in [0,1]$, pick a noise sample $x_0 \sim p_0$, pick a data sample $x_1 \sim p_1$, interpolate $x_t = (1-t) x_0 + t x_1$, and regress $v_\theta(x_t, t)$ onto the conditional velocity $x_1 - x_0$. At inference time, integrate the learned ODE from $t=0$ to $t=1$ with a handful of Euler or Heun steps. Compared to diffusion models, flow matching is faster (straighter trajectories mean fewer steps) and simpler to train (no noise schedule, no variance-preserving vs variance-exploding choices).</p>
+
+      <h3>VoiceBox: the infilling baseline before DiT-style flow took over</h3>
+
+      <p><strong>VoiceBox</strong> (Meta, NeurIPS 2023) was the landmark non-autoregressive model that showed continuous speech generation could match and beat codec LMs on zero-shot English TTS. On the benchmark comparison in the paper, VoiceBox reaches about <strong>1.9% word error rate</strong> on English zero-shot TTS versus about <strong>5.9% for VALL-E</strong>, while running inference at roughly <strong>20×</strong> the speed of autoregressive baselines at comparable NFE settings. VoiceBox is <em>infilling</em>-based: it trains a flow-matching-style model to generate speech in the context of surrounding audio and text, and that parallel generation is what unlocks the wall-clock win. Later DiT + flow-matching systems (F5-TTS, MegaTTS 3, Fox-TTS) inherited the same “generate the whole utterance in one sweep” philosophy.</p>
+
+      <div class="callout callout-math">
+        <div class="callout-title">Flow Matching Training Objective</div>
+        <p>The entire training loss for a flow matching TTS model is:
+        $$\mathcal{L}_{\text{FM}}(\theta) = \mathbb{E}_{t \sim \mathcal{U}(0,1),\, x_0 \sim \mathcal{N}(0, I),\, x_1 \sim p_{\text{data}}} \left[ \| v_\theta\!\left((1-t) x_0 + t x_1,\, t,\, \text{cond}\right) - (x_1 - x_0) \|^2 \right]$$
+        where <code>cond</code> is the conditioning signal (text, phonemes, reference audio). That is the whole thing. No ELBOs, no noise schedules, no variance posteriors — just a regression loss on a vector-valued function.</p>
+      </div>
+
+      <h3>F5-TTS: the benchmark flow-matching TTS</h3>
+
+      <p><strong>F5-TTS</strong> (ShanghaiTech, 2024 → 2025) is the cleanest illustration of the idea. It is 336M parameters, trained on 100K hours of multilingual speech, and beats every prior open-weight system on LibriSpeech-PC test-clean. The architecture is shockingly simple: a Diffusion Transformer (DiT) backbone consumes a noisy mel spectrogram $x_t$ concatenated with a text condition padded to the audio length, outputs a predicted velocity, and that is the whole model. There is no duration predictor, no phoneme aligner, no explicit speaker encoder. Voice cloning works by prepending the reference audio's mel spectrogram as unnoised context — the flow only has to "fill in" the target-text portion.</p>
+
+      <p>The padding-to-audio-length trick deserves attention. Traditional non-autoregressive TTS models (FastSpeech 2, Glow-TTS) all need an explicit duration predictor: given the phoneme sequence, predict how many audio frames each phoneme should occupy. This is a separate head that has to be trained, and its errors cascade into the final output. F5-TTS eliminates it by padding the text tokens with a special filler token until the text length matches the audio length, and letting the DiT attention layer figure out the alignment on its own. This works because the training data always comes as text-audio pairs at their natural lengths, so the model learns the implicit alignment during pretraining.</p>
+
+      <figure class="diagram-figure">
+        <svg width="100%" viewBox="0 0 800 360" xmlns="http://www.w3.org/2000/svg">
+          <defs>
+            <marker id="ch26-arr4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
+              <path d="M1 1L9 5L1 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+            </marker>
+          </defs>
+
+          <text x="400" y="26" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="14" font-weight="600" fill="#1A1A18">F5-TTS: flow matching on padded mel, no duration predictor</text>
+
+          <!-- Left: text padded -->
+          <rect x="40" y="70" width="220" height="44" rx="5" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1.5"/>
+          <text x="150" y="96" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="500" fill="#0F6E56">text: "hello world"</text>
+          <text x="150" y="108" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-style="italic" fill="#9C9A94">(10 phonemes)</text>
+
+          <line x1="150" y1="114" x2="150" y2="134" stroke="#9C9A94" stroke-width="1.5" marker-end="url(#ch26-arr4)"/>
+
+          <rect x="40" y="134" width="220" height="44" rx="5" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1.5"/>
+          <text x="150" y="154" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="500" fill="#0F6E56">padded: h e l l o _ _ _ w o r l d _ _</text>
+          <text x="150" y="170" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-style="italic" fill="#9C9A94">length = mel frames (200)</text>
+
+          <!-- Noise mel -->
+          <rect x="40" y="200" width="220" height="50" rx="5" fill="#FAEEDA" stroke="#EF9F27" stroke-width="1.5"/>
+          <text x="150" y="222" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="500" fill="#854F0B">noisy mel  x_t = (1−t)ε + t·mel</text>
+          <text x="150" y="238" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#9C9A94">(B, 80, 200)</text>
+
+          <!-- Right: DiT -->
+          <rect x="320" y="120" width="240" height="130" rx="6" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1.5"/>
+          <text x="440" y="148" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="13" font-weight="600" fill="#534AB7">DiT backbone</text>
+          <text x="440" y="168" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#5C5B56">concat(x_t, text_padded)</text>
+          <text x="440" y="186" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#5C5B56">+ time embedding t</text>
+          <text x="440" y="206" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#5C5B56">22 transformer blocks</text>
+          <text x="440" y="224" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#5C5B56">output: velocity v_θ</text>
+          <text x="440" y="242" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" font-style="italic" fill="#534AB7">(336M params)</text>
+
+          <line x1="260" y1="225" x2="320" y2="190" stroke="#9C9A94" stroke-width="1.5" marker-end="url(#ch26-arr4)"/>
+          <line x1="260" y1="156" x2="320" y2="170" stroke="#9C9A94" stroke-width="1.5" marker-end="url(#ch26-arr4)"/>
+
+          <!-- Right-of-DiT: integrate -->
+          <line x1="560" y1="185" x2="590" y2="185" stroke="#534AB7" stroke-width="2" marker-end="url(#ch26-arr4)"/>
+
+          <rect x="590" y="155" width="170" height="60" rx="5" fill="#FAECE7" stroke="#F0997B" stroke-width="1.5"/>
+          <text x="675" y="180" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="500" fill="#993C1D">ODE integrate</text>
+          <text x="675" y="198" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#5C5B56">t: 0 → 1</text>
+          <text x="675" y="212" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#5C5B56">~8 Euler steps</text>
+
+          <line x1="675" y1="215" x2="675" y2="240" stroke="#9C9A94" stroke-width="1.5" marker-end="url(#ch26-arr4)"/>
+
+          <rect x="580" y="240" width="190" height="40" rx="5" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1.5"/>
+          <text x="675" y="264" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="500" fill="#0F6E56">clean mel → vocoder</text>
+
+          <!-- Caption -->
+          <text x="400" y="322" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-style="italic" fill="#9C9A94">no duration predictor — text is padded to audio length</text>
+          <text x="400" y="340" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-style="italic" fill="#9C9A94">no speaker encoder — reference mel is prepended as unnoised context</text>
+        </svg>
+        <figcaption>Figure 26.5 — F5-TTS is a pure Diffusion Transformer trained with flow matching. At training time, the text is padded with a filler token to match the audio length, and the DiT learns the implicit alignment between text positions and audio frames. At inference, noise is integrated to a clean mel spectrogram in ~8 ODE steps and passed through a vocoder. The elegance is in what is <em>missing</em>: no duration predictor, no speaker encoder, no phoneme aligner.</figcaption>
+      </figure>
+
+      <h3>MegaTTS 3, Fox-TTS, MaskGCT</h3>
+
+      <p>The flow matching family evolved rapidly in 2025. <strong>MegaTTS 3</strong> (ByteDance, 2025) kept the latent DiT idea but added a sparse alignment module that constrains the text-audio attention to a monotonic region, cutting word-skipping failures on very long utterances. It also used <strong>piecewise rectified flow</strong>, a distillation technique that straightens the learned trajectory so inference only needs eight ODE steps instead of twenty-five. <strong>Fox-TTS</strong> (ICLR 2025) introduced a learnable speaker encoder that plugs into the DiT as extra conditioning, making expressive voice cloning more robust on out-of-distribution speakers. <strong>MaskGCT</strong> (ICLR 2025) took a completely different angle: instead of continuous flow matching, it trains a masked generative codec transformer that predicts all codec tokens in parallel over multiple masking stages, getting the non-autoregressive speed advantage while staying fully discrete. Related DiT-on-continuous-latent systems include <strong>DiTTo-TTS</strong>, <strong>StableTTS</strong>, and <strong>Irodori-TTS</strong> — same playbook (conditioned transformer + flow or diffusion in latent space), different training data and vocoder stacks.</p>
+
+      <p>The thing to notice is that all of these models converged on the same performance envelope. By mid-2025 the difference between F5-TTS, MaskGCT, and MegaTTS 3 on Seed-TTS Eval was within a few tenths of a percent on word error rate and within one-hundredth on speaker similarity. The field had run out of room on the objective metrics, and the game shifted to latency, controllability, and streaming — which is where the third family came in.</p>
+
+      <p>Why did flow matching and DiTs win so decisively for research prototypes? <strong>Stability on long utterances</strong>: the whole spectrogram or latent is refined jointly, so errors do not compound token-by-token. <strong>Fewer sampling steps</strong>: rectified and optimal-transport paths need far fewer function evaluations than classical diffusion. <strong>Scaling</strong>: the same DiT blocks and training recipes that worked for images transfer cleanly to mel or codec latents with minimal architectural ceremony. That combination is why new papers in 2025–2026 default to “DiT + flow” unless product constraints force AR token streaming.</p>
+    </section>
+
+    <!-- ============================================================
+         SECTION 5: STREAMING TTS
+         ============================================================ -->
+    <section class="chapter-section" id="streaming-tts">
+      <h2>Streaming TTS and Delayed Streams Modeling</h2>
+
+      <p>A voice assistant cannot wait for the user to finish speaking, run an LLM to generate a response, run a TTS model to synthesize the whole response, and only then start playing audio. That pipeline accumulates latency at every stage, and the total time-to-first-sound determines whether the assistant feels responsive or sluggish. For conversational AI to feel alive, the TTS model has to start producing audio before the LLM has even finished generating the response text. That is the streaming TTS problem, and it is harder than it sounds.</p>
+
+      <p>Flow matching models are natively batch: they integrate an ODE over the entire utterance, and you cannot start playing the first second of audio until the last second has been generated. Autoregressive codec LMs are natively streaming over the output dimension — they produce one audio token at a time and you can decode and play those tokens as they arrive — but they are <em>not</em> natively streaming over the input dimension. Classical VALL-E needs the entire text prompt up front, so the clock starts when the LLM finishes generating text, not when it starts. A model that streams in text and streams in audio simultaneously requires a different mental model.</p>
+
+      <h3>Delayed Streams Modeling</h3>
+
+      <p>Kyutai's answer is <strong>Delayed Streams Modeling</strong> (DSM), the framework underneath both Moshi and Kyutai TTS. The idea is to align all modalities into synchronized streams and fuse them into a single sequence that a decoder-only LM predicts token-by-token. For TTS specifically, the text stream and the audio stream run at different natural rates, so you align them by introducing a fixed delay: audio at time $t$ depends on text up to time $t - \Delta$. At every step the model emits one text token and one audio token, where the audio token is the Mimi codec frame that should be played at that moment and the text token is the next piece of the LLM's output. You can feed text in as it is produced by an upstream LLM, and the audio comes out at the same rate. There is no waiting.</p>
+
+      <figure class="diagram-figure">
+        <svg width="100%" viewBox="0 0 800 340" xmlns="http://www.w3.org/2000/svg">
+          <defs>
+            <marker id="ch26-arr5" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
+              <path d="M1 1L9 5L1 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+            </marker>
+          </defs>
+
+          <text x="400" y="26" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="14" font-weight="600" fill="#1A1A18">Delayed Streams Modeling — text and audio as parallel time-aligned streams</text>
+
+          <!-- Time axis -->
+          <line x1="60" y1="280" x2="760" y2="280" stroke="#C8C6BE" stroke-width="1.5"/>
+          <text x="400" y="305" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#9C9A94">time (12.5 Hz frames)</text>
+
+          <!-- Text stream -->
+          <text x="30" y="95" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="500" fill="#0F6E56">text</text>
+
+          <g transform="translate(0, 0)">
+            <rect x="60"  y="75" width="60" height="36" rx="4" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1"/>
+            <text x="90" y="98" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" fill="#0F6E56">hel</text>
+            <rect x="130" y="75" width="60" height="36" rx="4" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1"/>
+            <text x="160" y="98" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" fill="#0F6E56">lo</text>
+            <rect x="200" y="75" width="60" height="36" rx="4" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1"/>
+            <text x="230" y="98" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" fill="#0F6E56">wor</text>
+            <rect x="270" y="75" width="60" height="36" rx="4" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1"/>
+            <text x="300" y="98" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" fill="#0F6E56">ld</text>
+            <rect x="340" y="75" width="60" height="36" rx="4" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1"/>
+            <text x="370" y="98" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" fill="#0F6E56">how</text>
+            <rect x="410" y="75" width="60" height="36" rx="4" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1"/>
+            <text x="440" y="98" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" fill="#0F6E56">are</text>
+            <rect x="480" y="75" width="60" height="36" rx="4" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1"/>
+            <text x="510" y="98" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" fill="#0F6E56">you</text>
+            <rect x="550" y="75" width="60" height="36" rx="4" fill="#FFFFFF" stroke="#C8C6BE" stroke-width="1"/>
+            <text x="580" y="98" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" fill="#9C9A94">_</text>
+            <rect x="620" y="75" width="60" height="36" rx="4" fill="#FFFFFF" stroke="#C8C6BE" stroke-width="1"/>
+            <text x="650" y="98" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" fill="#9C9A94">_</text>
+            <rect x="690" y="75" width="60" height="36" rx="4" fill="#FFFFFF" stroke="#C8C6BE" stroke-width="1"/>
+            <text x="720" y="98" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" fill="#9C9A94">_</text>
+          </g>
+
+          <!-- Audio stream (delayed by 2) -->
+          <text x="30" y="175" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="500" fill="#534AB7">audio</text>
+
+          <g transform="translate(140, 80)">
+            <rect x="60"  y="75" width="60" height="36" rx="4" fill="#FFFFFF" stroke="#C8C6BE" stroke-width="1"/>
+            <text x="90" y="98" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" fill="#9C9A94">ε</text>
+            <rect x="130" y="75" width="60" height="36" rx="4" fill="#FFFFFF" stroke="#C8C6BE" stroke-width="1"/>
+            <text x="160" y="98" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" fill="#9C9A94">ε</text>
+            <rect x="200" y="75" width="60" height="36" rx="4" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1"/>
+            <text x="230" y="98" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" fill="#534AB7">a₁</text>
+            <rect x="270" y="75" width="60" height="36" rx="4" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1"/>
+            <text x="300" y="98" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" fill="#534AB7">a₂</text>
+            <rect x="340" y="75" width="60" height="36" rx="4" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1"/>
+            <text x="370" y="98" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" fill="#534AB7">a₃</text>
+            <rect x="410" y="75" width="60" height="36" rx="4" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1"/>
+            <text x="440" y="98" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" fill="#534AB7">a₄</text>
+            <rect x="480" y="75" width="60" height="36" rx="4" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1"/>
+            <text x="510" y="98" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" fill="#534AB7">a₅</text>
+          </g>
+
+          <!-- Delay arrow -->
+          <path d="M 95 120 Q 160 150, 225 165" fill="none" stroke="#EF9F27" stroke-width="2" marker-end="url(#ch26-arr5)"/>
+          <text x="175" y="150" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#854F0B">Δ = 2 frames delay</text>
+
+          <!-- Bottom explanation -->
+          <rect x="40" y="225" width="720" height="40" rx="6" fill="#F1EFE8" stroke="#C8C6BE" stroke-width="1"/>
+          <text x="400" y="247" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="500" fill="#5C5B56">At every step the decoder predicts BOTH the next text token and the audio token for frame (t − Δ)</text>
+          <text x="400" y="262" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-style="italic" fill="#9C9A94">audio can start playing Δ frames after text begins arriving — 160 ms at 12.5 Hz with Δ = 2</text>
+        </svg>
+        <figcaption>Figure 26.6 — Delayed Streams Modeling. Text tokens and Mimi audio tokens are interleaved into a single decoder-only sequence, with a fixed delay $\Delta$ between text and audio so the model always has "enough" future text context to decide what to say. Streaming in text and streaming in audio are the same operation: at every step predict the next token in each stream. This gives Kyutai TTS a time-to-first-sound below 250 ms even when text is being piped in from an LLM in real time.</figcaption>
+      </figure>
+
+      <p>Kyutai released three DSM-based models in rapid succession. <strong>Moshi</strong> (2024) was the first full-duplex speech-text foundation model — you can literally talk over it and it keeps going. <strong>Kyutai TTS 2B</strong> (July 2025) specialized the architecture for one-way streaming synthesis, trained on 2.5 million hours of speech, with 220 ms end-to-end latency and streaming text input. <strong>Kyutai Pocket TTS</strong> (January 2026) distilled the idea down to a 100M-parameter variant that runs on a CPU in real time, making on-device voice assistants practical without a GPU.</p>
+
+      <p>Other streaming-oriented systems sit alongside DSM. <strong>CosyVoice 2</strong> (Alibaba, 2025) advertises a unified streaming and non-streaming training framework with about <strong>150 ms</strong> first-packet latency and <strong>30–50% fewer pronunciation errors</strong> than CosyVoice 1 — a reminder that hybrid AR + flow designs can be tuned for product latency, not just batch quality. <strong>Sesame CSM-1B</strong> (March 2025) pairs a Llama-style decoder with the Mimi codec for end-to-end conversational TTS: prior dialogue turns are fed as context so the voice stays consistent across turns, which matters for agents that speak in multi-turn sessions.</p>
+
+      <h3>Voxtral: the 2026 hybrid</h3>
+
+      <p>The most interesting April-2026 entrant is Mistral's <strong>Voxtral TTS</strong>, released March 26, 2026. It is a hybrid two-stage architecture built on Ministral 3B: a 3.4B autoregressive decoder predicts the single semantic token per 12.5 Hz frame, and a 390M flow-matching acoustic module predicts the 36 acoustic tokens per frame conditioned on the decoder state. A 300M neural audio codec rounds out the pipeline. The AR decoder handles the slow, linguistic part of speech — what is being said, which phoneme comes next, where the pauses fall — and the flow matching module handles the fast, high-bandwidth part — timbre, breathiness, room tone, emotional color.</p>
+
+      <p>Why does this work? Because the bottleneck in an AR codec LM is the per-token generation cost, and the bottleneck in a flow matching model is the lack of streaming. By making the AR part handle only one token per frame (the semantic token) and delegating the 36 acoustic tokens to a small parallel flow matching head, Voxtral gets AR-level streamability at flow-matching-level audio quality. The numbers back it up: 70 ms model latency for a 10-second sample, 9.7× real-time factor, and a 68.4% win rate against ElevenLabs Flash v2.5 in human evaluation. It is also open-weight, which puts the frontier of zero-shot voice cloning in anyone's hands for the first time.</p>
+
+      <div class="callout callout-insight">
+        <div class="callout-title">Key Insight</div>
+        <p>The semantic/acoustic split is the key architectural idea in 2026-era TTS. Semantic tokens encode "what is being said" and change slowly, so they are generated autoregressively at a manageable rate. Acoustic tokens encode "how it sounds" and change rapidly, so they are generated in parallel by a flow matching model. This is the same factorization the brain makes between the linguistic content of speech and the paralinguistic envelope, and it is why CosyVoice 2, Seed-TTS, and Voxtral all converged on it independently.</p>
+      </div>
+    </section>
+
+    <!-- ============================================================
+         SECTION 6: ZERO-SHOT FRONTIER
+         ============================================================ -->
+    <section class="chapter-section" id="zero-shot-frontier">
+      <h2>The Zero-Shot Voice Cloning Frontier</h2>
+
+      <p>Beyond architecture families, the product surface is a zoo of named systems. <strong>Seed-TTS</strong> (ByteDance) remains the proprietary benchmark others cite for ultra-realistic cloning and emotion control. <strong>IndexTTS 2</strong> (September 2025) combines AR codec modeling with disentangled duration and emotion control. <strong>Fish Audio S2 Pro</strong> emphasizes data scale (10M+ hours claimed) and strong word-error performance on Seed-TTS Eval and EmergentTTS-Eval. Open or semi-open AR stacks include <strong>Spark-TTS</strong>, <strong>Orpheus</strong> (Canopy AI, Llama-based 150M–3B), and niche models like <strong>Dia</strong> (Nari Labs) for multi-speaker dialogue with nonverbal cues. <strong>Kokoro-82M</strong> shows that a compact StyleTTS2-style architecture trained on under 100 hours of curated data can still top community leaderboards — quality over raw scale. Older open baselines — <strong>Tortoise</strong> and <strong>XTTS-v2</strong> — remain widely deployed because they are easy to run locally even if they no longer win Elo.</p>
+    </section>
+
+    <!-- ============================================================
+         SECTION 7: CONTROL AND THE LEADERBOARD
+         ============================================================ -->
+    <section class="chapter-section" id="control-and-benchmark">
+      <h2>Control, Evaluation, and the April 2026 Leaderboard</h2>
+
+      <p>Quality is saturating. The top models on Seed-TTS Eval now score within a fraction of a percent of each other on word error rate and within a few hundredths on speaker similarity. The game has moved to controllability — can you tell the model not just <em>what</em> to say, but <em>how</em> to say it? — and to streaming latency, which we already covered. Here we look at controllability and at the benchmark numbers that the field is competing on in April 2026.</p>
+
+      <h3>Three flavors of control</h3>
+
+      <p>The field has converged on three interfaces for expressive control. <strong>Audio tags</strong>, popularized by ElevenLabs v3 (general availability, March 14, 2026), let you inline annotations like <code>[whispers]</code>, <code>[excited]</code>, <code>[laughs]</code>, <code>[pauses]</code> directly into the text prompt. The tags are tokenized like ordinary text and the model learns during training to associate them with the corresponding paralinguistic behaviors. ElevenLabs reports roughly a <strong>68% reduction in errors on complex text</strong> (URLs, formulas, phone numbers, and similar) versus prior tiers, alongside <strong>70+ languages</strong> — the headline quality metric for v3 is often “sounds human,” but product teams care equally about not garbling structured strings. It is simple, composable, and the right abstraction for most applications.</p>
+
+      <p><strong>Natural language style instructions</strong>, pioneered by OpenAI's <code>gpt-4o-mini-tts</code>, take a plain-English description of the desired delivery — "speak slowly and with warmth" — and condition the generation on it. The advantage is expressiveness (the instruction space is effectively unlimited) but the disadvantage is determinism: the same instruction can produce different outputs and the user has no granular way to dial specific attributes.</p>
+
+      <p><strong>Disentangled reference audio</strong>, implemented by IndexTTS 2 (September 2025), Seed-TTS, and CosyVoice 2, takes two reference clips instead of one: a timbre reference for the voice identity, and an emotion reference for the delivery style. The model disentangles the two during training by applying data augmentation that separates speaker identity from prosodic variation. This is the most precise interface — you can clone Morgan Freeman's timbre and pair it with your friend's laugh — but it requires finding two good reference clips.</p>
+
+      <p>IndexTTS 2 additionally introduced precise duration control: you tell the model the target duration of the output in frames, and the autoregressive sampler is constrained to hit that target. This is the first <strong>AR</strong> TTS system to make tight duration control practical at scale, and it matters for dubbing, where generated lines have to fit the original video's timing to the frame.</p>
+
+      <p>For <strong>prosody transfer</strong> across languages, speech-to-speech translation systems such as Meta’s <strong>Seamless</strong> family demonstrated that preserving pitch contour, energy, and pause patterns matters as much as timbre: the “style” lives in those continuous prosodic variables, not only in discrete text. The same intuition shows up in emotion-reference conditioning for TTS — control the envelope and timing, not just the words.</p>
+
+      <h3>The Seed-TTS Eval benchmark</h3>
+
+      <p>The de facto benchmark for zero-shot voice cloning is <strong>Seed-TTS Eval</strong>, introduced by ByteDance alongside the Seed-TTS model itself. It consists of two test sets — English (test-en, based on LibriSpeech) and Chinese (test-zh) — and measures three numbers. <strong>Word error rate (WER)</strong> is computed by running Whisper on the synthesized audio and comparing against the target text. <strong>Speaker similarity (SIM)</strong> is the cosine similarity between a speaker embedding of the reference audio and a speaker embedding of the synthesized audio, using a WavLM-based verifier. <strong>UTMOS</strong> (now UTMOS-v2) is a neural mean opinion score predictor trained on human ratings.</p>
+
+      <p>A caveat that matters: UTMOS is a neural regressor, and like any regressor it has failure modes. The Matcha-TTS paper showed that a model can top UTMOS while being ranked third by human listeners, illustrating that objective MOS predictors are proxies, not ground truth. Any modern benchmark that only reports UTMOS is misleading; the serious ones report WER and SIM as well, and ideally include a pairwise human preference comparison on top.</p>
+
+      <p>Complementary batteries matter too. <strong>TTSDS2</strong> packages a broader set of robust objective checks aimed at catching synthetic-speech artifacts that WER alone misses. Community leaderboards such as the <strong>Hugging Face TTS Arena V2</strong> aggregate pairwise votes from listeners; they track perceived quality imperfectly but surface what people actually prefer when objective metrics tie.</p>
+
+      <h3>Snapshot of the April 2026 leaderboard</h3>
+
+      <p>Here is the picture as of early April 2026, pulled from the Artificial Analysis Speech Arena and the Seed-TTS Eval leaderboard:</p>
+
+      <table>
+        <thead>
+          <tr>
+            <th>Model</th>
+            <th>Type</th>
+            <th>Params</th>
+            <th>Open weights</th>
+            <th>Notes</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Inworld TTS 1.5 Max</td>
+            <td>Hybrid (proprietary)</td>
+            <td>—</td>
+            <td>No</td>
+            <td>#1 on Speech Arena Elo (1217)</td>
+          </tr>
+          <tr>
+            <td>Inworld TTS 1 Max</td>
+            <td>Hybrid (proprietary)</td>
+            <td>—</td>
+            <td>No</td>
+            <td>Elo 1173 (Artificial Analysis Speech Arena snapshot)</td>
+          </tr>
+          <tr>
+            <td>Speech 2.8 HD</td>
+            <td>Proprietary</td>
+            <td>—</td>
+            <td>No</td>
+            <td>Elo 1162 (Speech Arena snapshot)</td>
+          </tr>
+          <tr>
+            <td>ElevenLabs Eleven v3</td>
+            <td>Proprietary</td>
+            <td>—</td>
+            <td>No</td>
+            <td>#2 (1177); audio tags, 70+ languages</td>
+          </tr>
+          <tr>
+            <td>Seed-TTS (ByteDance)</td>
+            <td>Hybrid AR + flow</td>
+            <td>—</td>
+            <td>No</td>
+            <td>Benchmark reference, human parity</td>
+          </tr>
+          <tr>
+            <td>Voxtral TTS (Mistral, Mar 2026)</td>
+            <td>Hybrid AR (3.4B) + flow (390M) + codec (300M)</td>
+            <td>4B</td>
+            <td>Yes</td>
+            <td>68.4% win rate vs ElevenLabs Flash v2.5, 70 ms latency</td>
+          </tr>
+          <tr>
+            <td>Step Audio EditX</td>
+            <td>Hybrid</td>
+            <td>—</td>
+            <td>Yes</td>
+            <td>#1 open-weight on Speech Arena (Elo 1094)</td>
+          </tr>
+          <tr>
+            <td>IndexTTS 2</td>
+            <td>AR codec LM</td>
+            <td>~1.5B</td>
+            <td>Yes</td>
+            <td>Precise duration control, emotion disentanglement</td>
+          </tr>
+          <tr>
+            <td>Fish Audio S2 Pro</td>
+            <td>AR codec LM</td>
+            <td>~1B</td>
+            <td>Partial</td>
+            <td>Best WER on Seed-TTS Eval, 81.88% EmergentTTS-Eval</td>
+          </tr>
+          <tr>
+            <td>CosyVoice 2</td>
+            <td>Hybrid AR + flow</td>
+            <td>~0.5B</td>
+            <td>Yes</td>
+            <td>150 ms streaming, 30–50% fewer pronunciation errors vs v1</td>
+          </tr>
+          <tr>
+            <td>F5-TTS</td>
+            <td>Flow matching DiT</td>
+            <td>336M</td>
+            <td>Yes</td>
+            <td>Simplest strong baseline, no duration predictor</td>
+          </tr>
+          <tr>
+            <td>Kyutai TTS 2B</td>
+            <td>AR (DSM) + Mimi codec</td>
+            <td>2B</td>
+            <td>Yes</td>
+            <td>220 ms latency, streams text input</td>
+          </tr>
+          <tr>
+            <td>Sesame CSM-1B</td>
+            <td>AR codec LM (Llama + Mimi)</td>
+            <td>1B</td>
+            <td>Yes</td>
+            <td>Conversational, uses dialogue context</td>
+          </tr>
+          <tr>
+            <td>Kokoro-82M</td>
+            <td>Lightweight neural TTS (StyleTTS2-style)</td>
+            <td>82M</td>
+            <td>Yes</td>
+            <td>Top community arena entries; &lt;100 h curated training data; not a zero-shot cloner</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>A minimal flow matching TTS training loop</h3>
+
+      <p>Here is the entire training inner loop for a flow matching TTS model in pure PyTorch. Every non-trivial line corresponds to something that exists in F5-TTS or VoiceBox; the rest is shape bookkeeping.</p>
+
+<pre><code class="language-python">import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class FlowMatchTTS(nn.Module):
+    """Toy F5-TTS-style flow matching model. DiT velocity field over mel spectrograms."""
+    def __init__(self, n_text=256, n_mels=80, d_model=512, n_layers=22, n_heads=8):
+        super().__init__()
+        self.text_emb = nn.Embedding(n_text + 1, d_model)  # +1 for filler token
+        self.mel_in   = nn.Linear(n_mels, d_model)
+        self.time_emb = nn.Sequential(nn.Linear(1, d_model), nn.SiLU(), nn.Linear(d_model, d_model))
+        layer = nn.TransformerEncoderLayer(d_model, n_heads, 4*d_model,
+                                           batch_first=True, norm_first=True)
+        self.blocks   = nn.TransformerEncoder(layer, n_layers)
+        self.head     = nn.Linear(d_model, n_mels)         # predict velocity
+
+    def forward(self, mel_t, text_padded, t):
+        # mel_t:       (B, L, n_mels) — noisy mel along the flow trajectory
+        # text_padded: (B, L)         — text IDs padded to audio length with filler
+        # t:           (B,)           — flow time ∈ [0,1]
+        x  = self.mel_in(mel_t) + self.text_emb(text_padded)      # (B, L, d)
+        te = self.time_emb(t.view(-1, 1))[:, None]                # (B, 1, d)
+        h  = self.blocks(x + te)                                  # (B, L, d)
+        return self.head(h)                                       # (B, L, n_mels)  — velocity
+
+def train_step(model, mel, text_padded, optim):
+    """One flow matching gradient step."""
+    B = mel.size(0)
+    t   = torch.rand(B, device=mel.device)                        # (B,)
+    eps = torch.randn_like(mel)                                   # base noise
+    # linear interpolation between noise (t=0) and data (t=1)
+    mel_t = (1 - t)[:, None, None] * eps + t[:, None, None] * mel
+    target_v = mel - eps                                          # conditional velocity
+    pred_v   = model(mel_t, text_padded, t)
+    loss     = F.mse_loss(pred_v, target_v)
+    optim.zero_grad(); loss.backward(); optim.step()
+    return loss.item()
+
+@torch.no_grad()
+def sample(model, text_padded, mel_len, n_steps=8):
+    """Euler integrator: noise → mel over n_steps."""
+    B, L = text_padded.shape
+    x = torch.randn(B, L, 80, device=text_padded.device)
+    dt = 1.0 / n_steps
+    for i in range(n_steps):
+        t = torch.full((B,), i * dt, device=text_padded.device)
+        v = model(x, text_padded, t)
+        x = x + dt * v                                            # Euler step
+    return x   # clean mel, ready for a vocoder
+</code></pre>
+
+      <p>Read the <code>train_step</code> function carefully, because every commercial flow matching TTS system in production in April 2026 is doing a version of exactly this. You pick a random flow time <code>t</code>, you linearly interpolate between Gaussian noise and the true mel, you regress the model's output onto the difference <code>mel - eps</code>, and that is the entire loss. Sampling runs the learned vector field through a small number of Euler steps. Eight steps is enough for F5-TTS quality; with piecewise rectified flow (MegaTTS 3) you can get it down to four or five. This is what replaced diffusion models in speech synthesis — not because flow matching is fundamentally better at modeling the data, but because the training loss is so much simpler that it is easier to scale, debug, and deploy.</p>
+
+      <p>The final thing to notice is what this code does <em>not</em> contain. No phoneme aligner. No duration predictor. No attention alignment loss. No speaker embedding network. No prosody extractor. The minimal recipe for a state-of-the-art zero-shot TTS system in 2026 is a DiT, a flow matching loss, a good codec or mel vocoder, and a lot of speech data. Everything else is a feature, not a necessity.</p>
+
+      <div class="callout callout-warning">
+        <div class="callout-title">Caveat</div>
+        <p>Leaderboard numbers in this chapter are a snapshot as of April 2026. Voice synthesis quality is saturating fast — most gains now come from latency, controllability, and multilingual coverage rather than raw naturalness. When a new model appears, the right question is not "what is its UTMOS on Seed-TTS Eval" but "what new axis of control did it unlock at that quality level." The history of the field since 2023 is a steady march from "can it clone a voice" to "can it clone a voice in 70 ms while streaming text from an LLM in a language with 3000 speakers." That march is where all the remaining progress lives.</p>
+      </div>
+    </section>
+
+  </article>
+
+  <footer class="chapter-footer">
+    <div class="footer-nav">
+      <a href="ch25.html">← Previous: Speech Recognition Transformers</a>
+      <a href="ch27.html">Next: Audio Understanding and Music Generation →</a>
+    </div>
+  </footer>
+
+</body>
+</html>
