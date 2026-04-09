@@ -535,7 +535,7 @@ retrieval systems, and distributed training, with rigorous benchmarking methodol
 - GPU cluster topology: NVLink within node, InfiniBand/RoCE across nodes
 - Compute vs memory vs bandwidth bound operations in transformers
 - Activation checkpointing (gradient checkpointing): trade compute for memory
-- FlashAttention role in distributed training (see Chapter 43)
+- FlashAttention role in distributed training (see Chapter 38)
 - Monitoring: loss curves, gradient norms, activation statistics, MFU (model FLOP utilization)
 
 **Chinchilla-optimal data planning**
@@ -1169,7 +1169,7 @@ and unified audio-visual models, with evaluation grounded in domain-standard met
 
 ---
 
-### Chapter 24: Speech Recognition Transformers
+### Chapter 25: Speech Recognition Transformers
 
 **wav2vec 2.0 (Baevski et al., 2020)**
 - Raw waveform input: CNN feature extractor + transformer encoder
@@ -1183,55 +1183,133 @@ and unified audio-visual models, with evaluation grounded in domain-standard met
 - K-means clustering on MFCC features, then on HuBERT features (iterative refinement)
 - HuBERT Large pre-trained on 60K hours Libri-Light: state-of-the-art low-resource ASR
 
-**Whisper (Radford et al., 2022)**
+**Whisper family (Radford et al., 2022 → 2024)**
 - Supervised at scale: 680K hours of labeled multilingual audio from the internet
 - Log-mel spectrogram input: 80 mel bins, 25ms windows, 10ms hop
 - Sequence-to-sequence transformer: encoder + decoder, joint multilingual + task modeling
 - Multitask: transcription, translation, language ID, timestamp prediction
 - Whisper large v3: improved multilingual, timestamp accuracy, reduced hallucination
+- Whisper large v3 Turbo (Oct 2024): 4-decoder-layer variant, ~216× real-time, transcription-only (no translation), minimal quality loss
+- OWSM v3.1 / v4 (CMU WAVLab): fully reproducible open Whisper-style training on ESPnet with public data, code, and logs
 
-**Conformer architecture**
-- Combining convolution and attention: local patterns (conv) + global context (attention)
+**Conformer and its successors**
 - Conformer block: feed-forward → multi-head attention → convolution → feed-forward (Macaron)
-- Conformer vs Transformer on LibriSpeech: consistent improvement from conv module
-- Use in streaming ASR: causal convolution and causal attention variants
+- Conformer vs Transformer on LibriSpeech: consistent improvement from convolution module
+- Streaming Conformer: causal convolution and chunked causal attention
+- FastConformer (NVIDIA): 8× subsampling, depth-wise separable conv, reduced memory for long-form audio
+- E-Branchformer: parallel branches for local (conv) and global (attention) with a merge module
+- Zipformer (ICLR 2024): U-Net-style encoder with multi-rate stacks, reused attention weights, BiasNorm; current SOTA pure encoder on LibriSpeech/WenetSpeech
 
-**CTC decoding**
+**Decoding strategies: CTC, attention, and transducers**
 - Connectionist Temporal Classification: blank token, collapse rule, forward-backward algorithm
 - CTC vs attention decoder: CTC for streaming, attention for quality
 - Hybrid CTC/attention: joint training, beam search with CTC prefix score
+- RNN-Transducer (RNN-T): encoder + prediction network + joint network for streaming with output dependencies
+- Token-and-Duration Transducer (TDT, NVIDIA): predicts token and duration jointly, fewer blanks, faster inference
+- When to use which: CTC (simplest, streaming), AED (best offline quality), RNN-T/TDT (streaming with context), LLM decoder (state of the art, see below)
+
+**Distillation and on-device ASR**
+- Distil-Whisper (Gandhi et al., 2023): pseudo-label distillation at scale, WER heuristic filtering, ~5.8× faster and 49% smaller than Whisper at <1% WER gap
+- Moonshine (2024): encoder-decoder with RoPE, no zero padding, 5× lower compute than Whisper tiny.en at the same WER
+- Moonshine v2 (2025): ergodic streaming encoder with sliding-window self-attention, low time-to-first-token for real-time edge use
+- WhisperKit and Apple Neural Engine: billion-parameter ASR on-device with quantization and Metal kernels
+- Deployment constraints: latency budgets, RAM budgets, chunked streaming with lookahead, endpointing
+
+**Massively multilingual speech foundation models**
+- Google USM (2023): 2B params, Conformer encoder, 12M hours speech + 28B sentences text, 300+ languages, self-supervised then text-injected then fine-tuned
+- SeamlessM4T v2 (Meta, 2023): UnitY2 architecture, unified speech/text translation for ~100 languages
+- Seamless (SeamlessExpressive + SeamlessStreaming): prosody, rate, pauses and voice-style preserved in cross-lingual S2ST; real-time streaming translation
+- NVIDIA Canary-1B-v2 and Parakeet-TDT-0.6B-v3 (2025): FastConformer encoder + Transformer or TDT decoder, 25 European languages, trained on the 1M-hour Granary corpus
+- Meta Omnilingual ASR (Nov 2025): wav2vec 2.0 encoder scaled to 7B, CTC and LLM decoder variants, 1,600+ languages, few-shot extension to new languages with a handful of paired examples
+
+**Speech-LLM fusion (the post-Whisper paradigm)**
+- Architecture pattern: audio encoder (Conformer/FastConformer/wav2vec-2.0) + modality adapter (Q-Former / windowed Q-Former / linear projection) + frozen or LoRA-adapted text LLM decoder
+- SALM (NVIDIA, 2023): first demonstration of in-context learning for ASR — keyword boosting from prompts, zero-shot speech translation
+- Qwen2-Audio and Qwen3-ASR-1.7B (Alibaba, 2025–26): multilingual ASR + language ID + timestamps on top of the Qwen LLM family; competitive with proprietary APIs
+- IBM Granite Speech 3.3 (2025): 2B/8B variants, conformer encoder + windowed Q-Former + LoRA, arbitrary-length audio (20-minute file on one H100)
+- NVIDIA Canary-Qwen 2.5B: SALM architecture, 5.63% WER on the Open ASR Leaderboard
+- Cohere Transcribe (Mar 2026): 2B FastConformer encoder + lightweight transformer decoder, 500K hours of supervised audio, 14 languages, 5.42% average WER — #1 on the HuggingFace Open ASR Leaderboard at the time of writing
+- What LLM decoders buy you: rare-word handling, in-context biasing, instruction following ("transcribe in all caps", "only the questions"), joint ASR + translation + summarization
+
+**Evaluation and the Open ASR Leaderboard**
+- Standard benchmarks: LibriSpeech (clean / other), TED-LIUM, GigaSpeech, VoxPopuli, FLEURS, Common Voice, AMI, Earnings-22
+- Metrics: WER (English and segmenting languages), CER (Chinese, Japanese), normalized WER after punctuation / casing strip
+- HuggingFace Open ASR Leaderboard (snapshot, April 2026): Cohere Transcribe 2B (5.42%), Canary-Qwen 2.5B (5.63%), Granite Speech 3.3 8B (5.85%), Parakeet-TDT, Whisper large v3 / v3 turbo as baselines
+- Robustness axes not captured by WER: hallucination rate on silence / music, long-form drift, code-switching, named-entity accuracy, speaker overlap
 
 ---
 
-### Chapter 25: Text-to-Speech and Voice Synthesis
+### Chapter 26: Text-to-Speech and Voice Synthesis
 
-**Transformer TTS baselines**
-- FastSpeech 2: non-autoregressive, duration predictor, pitch and energy prediction
-- Tacotron 2 + WaveNet: autoregressive mel generation then neural vocoder
+**The three architectural families**
+- Autoregressive codec language models (VALL-E, IndexTTS, Spark-TTS, Orpheus, Sesame CSM)
+- Non-autoregressive flow matching / Diffusion Transformers (VoiceBox, F5-TTS, MaskGCT, MegaTTS 3, Fox-TTS)
+- Hybrid two-stage: AR for semantic tokens + flow matching for acoustic detail (CosyVoice 2, Seed-TTS, Voxtral TTS)
+- When to pick which: latency (streaming AR wins), stability (flow matching wins), controllability (hybrid wins)
 
-**Neural codec language models**
-- EnCodec: residual vector quantization (RVQ) audio codec, multi-scale codebook
-- Codec tokens as the speech vocabulary: discrete audio tokens for LM training
+**Neural audio codecs as the speech vocabulary**
+- Why codecs replaced mel spectrograms: discrete tokens plug into transformer LMs
+- EnCodec / DAC: pure acoustic RVQ, 24 kHz, multi-rate codebooks
+- SNAC (multi-scale): coarse tokens sampled less frequently, hierarchical structure
+- X-Codec / DualCodec: fuse SSL semantic features into the first RVQ layer
+- Mimi (Kyutai, 2024): streaming, 12.5 Hz frame rate, 1.1 kbps, 80 ms latency, semantic distilled into first codebook
+- Voxtral Codec (Mistral, 2026): 12.5 Hz × 37 tokens per frame (1 semantic + 36 acoustic), 2.14 kbps
+- The frame-rate / bitrate / quality tradeoff: lower frame rate → shorter AR sequences but harder reconstruction
 
-**VALL-E (Wang et al., 2023)**
-- In-context TTS: 3-second enrollment audio as acoustic prompt
-- Autoregressive codec language model: AR model for first quantizer, NAR for residuals
-- Zero-shot voice cloning: match speaker timbre from 3-second reference
-- VALL-E 2: improved consistency, naturalness, prosody transfer
+**VALL-E and the codec LM paradigm (Wang et al., 2023 → 2024)**
+- In-context TTS: 3-second enrollment audio as acoustic prompt, no speaker embedding
+- AR model for the first RVQ codebook, NAR model for remaining codebooks
+- VALL-E 2 (2024): repetition-aware sampling, grouped code modeling, first to reach human parity on LibriSpeech and VCTK
+- VALL-E R, VALL-E X: monotonic alignment for robustness, cross-lingual extension
+- Failure modes of AR codec LMs: word skipping, repetition, attention collapse on long prompts
 
-**VoiceBox (Meta, 2023)**
-- Flow matching: non-autoregressive, fast generation via ODE
-- Text-conditioned audio infilling: in-context speech synthesis
-- Multilingual: 6 languages, style transfer, noise removal
+**Flow matching and Diffusion Transformers for speech**
+- Flow matching in one paragraph: learn a velocity field that transports Gaussian noise to the data distribution along an optimal-transport straight-line path
+- VoiceBox (Meta, 2023): infilling-based TTS, 20× faster than VALL-E, 1.9% WER on LibriSpeech
+- F5-TTS (2024 → 2025): simple DiT backbone, pad text to audio length, no duration predictor, 336M params
+- MaskGCT (ICLR 2025): masked generative codec transformer, non-autoregressive in parallel stages
+- MegaTTS 3 (2025): sparse-alignment latent diffusion transformer, piecewise rectified flow, 25 → 8 inference steps
+- Fox-TTS (ICLR 2025): scalable flow transformer + learnable speaker encoder for expressive zero-shot
+- DiTTo-TTS, StableTTS, Irodori-TTS: DiT-based with continuous latent tokens
+- Why flow matching is winning: stable long-form output, fewer sampling steps, scales cleanly with DiT
 
-**Modern zero-shot TTS frontier**
-- CosyVoice: supervised semantic tokens + flow matching, multilingual
-- F5-TTS: flow matching with DiT, simple and strong zero-shot
-- Seed-TTS (ByteDance): ultra-realistic, speaker cloning, emotion control
+**Streaming TTS and Delayed Streams Modeling**
+- The latency problem: AR codec LMs generate left-to-right, but have to wait for entire text
+- Delayed Streams Modeling (Kyutai, 2024–2025): align text and audio streams with a fixed delay, predict audio tokens with a decoder-only LM
+- Moshi (Kyutai, 2024): full-duplex speech-text foundation model using Mimi codec
+- Kyutai TTS 2B (Jul 2025): 2.5M hours, 220 ms latency, streams text input from an upstream LLM
+- Kyutai Pocket TTS (Jan 2026): 100M parameters, real-time CPU inference
+- Voxtral TTS (Mistral, Mar 2026): 4B open-weight hybrid (3.4B AR decoder + 390M flow-matching acoustic + 300M codec), 70 ms model latency, 9.7× RTF
+- CosyVoice 2 (Alibaba, 2025): unified streaming/non-streaming framework, 150 ms latency, 30–50% fewer pronunciation errors
+- Sesame CSM-1B (Mar 2025): Llama backbone + Mimi codec, end-to-end conversational, uses prior dialogue turns as context
+
+**The zero-shot voice cloning frontier**
+- ElevenLabs Eleven v3 (GA Mar 2026): audio tags for emotional control, 70+ languages, 68% reduction in complex-text errors, highest-quality closed model
+- Seed-TTS (ByteDance): ultra-realistic proprietary, speaker cloning, emotion control — the benchmark everyone compares against
+- IndexTTS 2 (Sep 2025): first AR TTS with precise duration control, disentangled timbre and emotion control
+- Fish Audio S2 Pro: 10M+ hours, best-in-class WER on Seed-TTS Eval, 81.88% win rate on EmergentTTS-Eval
+- Spark-TTS, Orpheus (Canopy AI, Llama-based 150M–3B), Dia (Nari Labs, multi-speaker dialogue with laughter/sighs)
+- Kokoro-82M: tiny, trained on <100 hours, ranked top on TTS Arena — shows that data quality can beat data scale
+- Tortoise and XTTS-v2: earlier open-weight baselines still in wide deployment
+
+**Control: emotion, duration, style**
+- Audio tags (ElevenLabs v3): `[whispers]`, `[laughs]`, `[excited]` as inline prompt annotations
+- Natural language style instructions (gpt-4o-mini-tts): "speak slowly and with warmth"
+- Duration-controlled generation (IndexTTS 2): predicted vs user-specified target duration
+- Emotion reference audio (Seed-TTS, CosyVoice 2): second reference clip for emotion, first for timbre
+- Prosody transfer: pitch, energy, pause pattern preservation in cross-lingual S2ST (Seamless)
+
+**Evaluation and leaderboards (April 2026 snapshot)**
+- Seed-TTS Eval: the de facto objective benchmark — WER, speaker similarity (SIM), UTMOS-v2
+- TTSDS2: robust objective eval battery for human-quality synthetic speech
+- Artificial Analysis Speech Arena Leaderboard (Elo): Inworld TTS 1.5 Max (1217), ElevenLabs v3 (1177), Inworld TTS 1 Max (1173), Speech 2.8 HD (1162)
+- Open-weights leader: Step Audio EditX (Mar 2026, Elo 1094); Voxtral TTS achieves 68.4% win rate over ElevenLabs Flash v2.5
+- HuggingFace TTS Arena V2: crowd-sourced pairwise comparisons
+- The UTMOS limitation: objective MOS predictors do not always agree with human listeners (Matcha-TTS case study)
 
 ---
 
-### Chapter 26: Audio Understanding and Music Generation
+### Chapter 27: Audio Understanding and Music Generation
 
 **Self-supervised audio pre-training**
 - Audio Spectrogram Transformer (AST): patch-based ViT applied to mel spectrograms
@@ -1256,7 +1334,7 @@ and unified audio-visual models, with evaluation grounded in domain-standard met
 
 ---
 
-### Chapter 27: Unified Audio-Visual-Text Models
+### Chapter 28: Unified Audio-Visual-Text Models
 
 **ImageBind (Meta, 2023)**
 - Binding six modalities: image, text, audio, depth, thermal, IMU
@@ -1279,7 +1357,7 @@ and unified audio-visual models, with evaluation grounded in domain-standard met
 
 ---
 
-### Chapter 28: Training Audio Transformers
+### Chapter 29: Training Audio Transformers
 
 **Input representations and their training implications**
 - Log-mel spectrogram: frequency decomposition, standard for classification and ASR
@@ -1312,7 +1390,7 @@ and unified audio-visual models, with evaluation grounded in domain-standard met
 
 ---
 
-### Chapter 29: Evaluating Audio and Speech Models
+### Chapter 30: Evaluating Audio and Speech Models
 
 **ASR evaluation**
 - Word Error Rate (WER): the standard metric, insensitive to capitalization/punctuation
@@ -1347,7 +1425,7 @@ including vision-language, omni models, document understanding, 3D, and robotics
 
 ---
 
-### Chapter 30: Contrastive Multimodal Learning
+### Chapter 31: Contrastive Multimodal Learning
 
 **CLIP (Radford et al., 2021)**
 - Architecture: image encoder (ViT or ResNet) + text encoder (Transformer), separate towers
@@ -1379,7 +1457,7 @@ including vision-language, omni models, document understanding, 3D, and robotics
 
 ---
 
-### Chapter 31: Vision-Language Models (VLMs)
+### Chapter 32: Vision-Language Models (VLMs)
 
 **BLIP (Li et al., 2022)**
 - Multi-task pre-training: ITC (image-text contrastive) + ITM (image-text matching) + LM
@@ -1416,7 +1494,7 @@ including vision-language, omni models, document understanding, 3D, and robotics
 
 ---
 
-### Chapter 32: Omni Models — Any-to-Any Generation
+### Chapter 33: Omni Models — Any-to-Any Generation
 
 **GPT-4o architecture and capabilities**
 - Native multimodal: single model processing text, image, audio simultaneously
@@ -1447,7 +1525,7 @@ including vision-language, omni models, document understanding, 3D, and robotics
 
 ---
 
-### Chapter 33: Document and Code Understanding
+### Chapter 34: Document and Code Understanding
 
 **Document transformers**
 - LayoutLM: 2D positional embeddings from bounding boxes, text + layout pre-training
@@ -1474,7 +1552,7 @@ including vision-language, omni models, document understanding, 3D, and robotics
 
 ---
 
-### Chapter 34: Transformers for 3D, Point Clouds and Robotics
+### Chapter 35: Transformers for 3D, Point Clouds and Robotics
 
 **3D point cloud transformers**
 - Point Transformer (Zhao et al., 2021): local attention in 3D space, k-NN graph
@@ -1495,7 +1573,7 @@ including vision-language, omni models, document understanding, 3D, and robotics
 
 ---
 
-### Chapter 35: Training Multimodal Transformers
+### Chapter 36: Training Multimodal Transformers
 
 **Modality alignment pre-training**
 - Stage 1: align visual encoder to language model with large-scale image-text data
@@ -1528,7 +1606,7 @@ including vision-language, omni models, document understanding, 3D, and robotics
 
 ---
 
-### Chapter 36: Evaluating Multimodal Models
+### Chapter 37: Evaluating Multimodal Models
 
 **Vision-language understanding**
 - VQAv2: open-ended visual question answering, balanced yes/no
@@ -1566,7 +1644,7 @@ better inference, longer context, sparser computation, and smaller deployable mo
 
 ---
 
-### Chapter 37: FlashAttention — IO-Aware Exact Attention
+### Chapter 38: FlashAttention — IO-Aware Exact Attention
 
 **The memory bottleneck in standard attention**
 - Attention matrix size: N^2 floats for sequence length N -- 100K context = 40GB
@@ -1605,7 +1683,7 @@ better inference, longer context, sparser computation, and smaller deployable mo
 
 ---
 
-### Chapter 38: The KV Cache — Architecture, Optimization and Management
+### Chapter 39: The KV Cache — Architecture, Optimization and Management
 
 **What is the KV cache?**
 - Autoregressive generation: at each step, recompute all previous K and V tensors -- expensive
@@ -1644,7 +1722,7 @@ better inference, longer context, sparser computation, and smaller deployable mo
 
 ---
 
-### Chapter 39: Positional Encodings — A Complete Taxonomy
+### Chapter 40: Positional Encodings — A Complete Taxonomy
 
 **Fixed absolute positional encodings**
 - Sinusoidal PE (Vaswani et al.): frequencies, phase, no learned parameters, extrapolation possible
@@ -1682,7 +1760,7 @@ better inference, longer context, sparser computation, and smaller deployable mo
 
 ---
 
-### Chapter 40: Sparse and Linear Attention
+### Chapter 41: Sparse and Linear Attention
 
 **The quadratic attention problem**
 - Self-attention cost: O(n^2) time and memory -- hard limit for very long sequences
@@ -1719,7 +1797,7 @@ better inference, longer context, sparser computation, and smaller deployable mo
 
 ---
 
-### Chapter 41: Mixture of Experts (MoE)
+### Chapter 42: Mixture of Experts (MoE)
 
 **The MoE concept**
 - Conditional computation: activate only a subset of parameters per input
@@ -1757,7 +1835,7 @@ better inference, longer context, sparser computation, and smaller deployable mo
 
 ---
 
-### Chapter 42: Parameter-Efficient Fine-Tuning
+### Chapter 43: Parameter-Efficient Fine-Tuning
 
 **Why PEFT?**
 - Full fine-tuning cost: update all 7-70B+ parameters for each task
@@ -1794,7 +1872,7 @@ better inference, longer context, sparser computation, and smaller deployable mo
 
 ---
 
-### Chapter 43: Quantization, Pruning and Distillation
+### Chapter 44: Quantization, Pruning and Distillation
 
 **Post-Training Quantization (PTQ)**
 - Weight-only quantization: quantize weights, dequantize on the fly for matmul
@@ -1829,7 +1907,7 @@ better inference, longer context, sparser computation, and smaller deployable mo
 
 ---
 
-### Chapter 44: Distributed Training — Full Reference
+### Chapter 45: Distributed Training — Full Reference
 
 *This chapter provides the definitive cross-domain reference for distributed training of transformers at scale.*
 
@@ -1882,7 +1960,7 @@ better inference, longer context, sparser computation, and smaller deployable mo
 
 ---
 
-### Chapter 45: Training Efficient and Sparse Models
+### Chapter 46: Training Efficient and Sparse Models
 
 **MoE-specific training**
 - Expert initialization: importance of identical initialization to avoid early collapse
@@ -1910,7 +1988,7 @@ better inference, longer context, sparser computation, and smaller deployable mo
 
 ---
 
-### Chapter 46: Benchmarking Efficiency
+### Chapter 47: Benchmarking Efficiency
 
 **Training efficiency metrics**
 - MFU (Model FLOP Utilization): actual FLOP/s / theoretical peak FLOP/s
@@ -1951,7 +2029,7 @@ and medicine, with honest assessment of where they work and where they fail.*
 
 ---
 
-### Chapter 47: Protein Structure Prediction
+### Chapter 48: Protein Structure Prediction
 
 **The protein folding problem**
 - Proteins are the machinery of life: enzymes, receptors, antibodies, motors
@@ -1992,7 +2070,7 @@ and medicine, with honest assessment of where they work and where they fail.*
 
 ---
 
-### Chapter 48: Genomics and Molecular Biology
+### Chapter 49: Genomics and Molecular Biology
 
 **DNA and RNA language models**
 - DNABERT: BERT pre-trained on human genome with k-mer tokenization
@@ -2018,7 +2096,7 @@ and medicine, with honest assessment of where they work and where they fail.*
 
 ---
 
-### Chapter 49: Drug Discovery and Chemistry
+### Chapter 50: Drug Discovery and Chemistry
 
 **Molecular transformers**
 - SMILES representation: linearize molecular graph as a string, apply BERT pre-training
@@ -2043,7 +2121,7 @@ and medicine, with honest assessment of where they work and where they fail.*
 
 ---
 
-### Chapter 50: Physics, Climate and Scientific Simulation
+### Chapter 51: Physics, Climate and Scientific Simulation
 
 **Weather and climate forecasting**
 - FourCastNet (Pathak et al., 2022): Fourier Neural Operator + attention, global weather at 25km
@@ -2069,7 +2147,7 @@ and medicine, with honest assessment of where they work and where they fail.*
 
 ---
 
-### Chapter 51: Medical Imaging and Clinical AI
+### Chapter 52: Medical Imaging and Clinical AI
 
 **Medical vision transformers**
 - TransFuse: parallel transformer + CNN branches, fusion for medical image segmentation
@@ -2101,7 +2179,7 @@ and medicine, with honest assessment of where they work and where they fail.*
 
 ---
 
-### Chapter 52: Training Scientific Foundation Models
+### Chapter 53: Training Scientific Foundation Models
 
 **Domain-specific tokenization**
 - Molecular SMILES tokenization: atom-level, k-mer BPE, SELFIES variants
@@ -2128,7 +2206,7 @@ and medicine, with honest assessment of where they work and where they fail.*
 
 ---
 
-### Chapter 53: Evaluating Scientific Transformers
+### Chapter 54: Evaluating Scientific Transformers
 
 **Protein structure evaluation**
 - TM-score: template modeling score, 0-1, values >0.5 indicate same fold
@@ -2168,7 +2246,7 @@ of reasoning, agents, mechanistic interpretability, and theoretical foundations.
 
 ---
 
-### Chapter 54: Structured State Space Models (SSMs)
+### Chapter 55: Structured State Space Models (SSMs)
 
 **State space models from control theory**
 - Linear time-invariant (LTI) system: dx/dt = Ax + Bu, y = Cx + Du
@@ -2199,7 +2277,7 @@ of reasoning, agents, mechanistic interpretability, and theoretical foundations.
 
 ---
 
-### Chapter 55: Mamba and Selective SSMs
+### Chapter 56: Mamba and Selective SSMs
 
 **Limitation of fixed SSMs**
 - S4 uses fixed A, B, C matrices: same transition for every input, no input-dependent selection
@@ -2238,7 +2316,7 @@ of reasoning, agents, mechanistic interpretability, and theoretical foundations.
 
 ---
 
-### Chapter 56: RWKV and RetNet — Recurrent Rivals
+### Chapter 57: RWKV and RetNet — Recurrent Rivals
 
 **RWKV (Peng et al., 2023)**
 - Motivation: combine RNN efficiency at inference with Transformer parallelism at training
@@ -2273,7 +2351,7 @@ of reasoning, agents, mechanistic interpretability, and theoretical foundations.
 
 ---
 
-### Chapter 57: Hybrid Architectures
+### Chapter 58: Hybrid Architectures
 
 **Why hybrids?**
 - Pure SSMs: great efficiency, weaker in-context learning than Transformers
@@ -2310,7 +2388,7 @@ of reasoning, agents, mechanistic interpretability, and theoretical foundations.
 
 ---
 
-### Chapter 58: Reasoning, Agents and Test-Time Compute
+### Chapter 59: Reasoning, Agents and Test-Time Compute
 
 **Chain-of-thought reasoning**
 - Wei et al. (2022): chain-of-thought prompting with few-shot exemplars
@@ -2345,7 +2423,7 @@ of reasoning, agents, mechanistic interpretability, and theoretical foundations.
 
 ---
 
-### Chapter 59: Training Post-Transformer Architectures
+### Chapter 60: Training Post-Transformer Architectures
 
 **SSM initialization**
 - HIPPO initialization for A matrix: critical for long-range memory in S4
@@ -2376,7 +2454,7 @@ of reasoning, agents, mechanistic interpretability, and theoretical foundations.
 
 ---
 
-### Chapter 60: Benchmarking Transformers vs Alternatives
+### Chapter 61: Benchmarking Transformers vs Alternatives
 
 **Language modeling perplexity comparisons**
 - Standard: Pile, WikiText-103, LAMBADA
@@ -2410,7 +2488,7 @@ of reasoning, agents, mechanistic interpretability, and theoretical foundations.
 
 ---
 
-### Chapter 61: Open Problems and Research Frontiers
+### Chapter 62: Open Problems and Research Frontiers
 
 **Mechanistic interpretability**
 - Circuits: identify specific computational circuits implementing tasks (indirect object identification)
@@ -2483,11 +2561,11 @@ of reasoning, agents, mechanistic interpretability, and theoretical foundations.
 
 *End of Table of Contents*
 
-> Total chapters: 61 core chapters + 5 appendices
-> Training chapters: Part I Ch.6, Part II Ch.14, Part III Ch.22, Part IV Ch.28, Part V Ch.35,
->   Part VI Ch.44+45, Part VII Ch.52, Part VIII Ch.59 — 10 dedicated training chapters
-> Evaluation chapters: Part II Ch.15+16, Part III Ch.23, Part IV Ch.29, Part V Ch.36,
->   Part VI Ch.46, Part VII Ch.53, Part VIII Ch.60 — 9 dedicated evaluation chapters
-> New vs v1: Video generation (Ch.21), FlashAttention dedicated chapter (Ch.37),
->   KV Cache dedicated chapter (Ch.38), Distributed Training full reference (Ch.44),
+> Total chapters: 62 core chapters + 5 appendices
+> Training chapters: Part I Ch.6, Part II Ch.14, Part III Ch.22, Part IV Ch.29, Part V Ch.36,
+>   Part VI Ch.45+46, Part VII Ch.53, Part VIII Ch.60 — 10 dedicated training chapters
+> Evaluation chapters: Part II Ch.15+16, Part III Ch.23, Part IV Ch.30, Part V Ch.37,
+>   Part VI Ch.47, Part VII Ch.54, Part VIII Ch.61 — 9 dedicated evaluation chapters
+> New vs v1: Video generation (Ch.21), FlashAttention dedicated chapter (Ch.38),
+>   KV Cache dedicated chapter (Ch.39), Distributed Training full reference (Ch.45),
 >   Retrieval and Ranking (Ch.13), Retrieval Evaluation (Ch.16)
