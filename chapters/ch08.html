@@ -649,6 +649,8 @@ blocks = nn.ModuleList([GPTBlock(768, 12, 3072) for _ in range(12)])
 
       <p>Mixtral 8×7B extended the Mistral architecture with a **sparse Mixture of Experts** (MoE): each FFN layer was replaced by 8 expert FFN networks, with a router selecting the top 2 experts per token. The total parameter count was 46.7B, but only 12.9B parameters were active per forward pass. This yielded GPT-3.5-level performance at a fraction of the inference cost. Mixtral 8×22B scaled the recipe further, with 141B total parameters and 39B active.</p>
 
+      <p>For a complete from-scratch implementation &mdash; SwiGLU experts, top-k router, scatter-gather dispatch, load-balance auxiliary loss, training pipeline on TinyStories, KV-cache inference, and expert-utilization forensics &mdash; see the <a href="ch08-bonus.html">Chapter 8 Bonus project</a>, which builds a small MoE language model end-to-end in pure PyTorch.</p>
+
       <h3>DeepSeek V2 and V3</h3>
 
       <p>Developed by the Chinese AI lab DeepSeek, DeepSeek V2 (2024) introduced two innovations that set it apart from the LLaMA-derivative models. First, **Multi-head Latent Attention (MLA)**, which compresses the key-value cache into a low-rank latent space, dramatically reducing memory while preserving or improving quality. Second, DeepSeekMoE, which uses a fine-grained expert architecture with more experts at smaller size plus shared experts that process every token.</p>

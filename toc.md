@@ -329,6 +329,25 @@ retrieval systems, and distributed training, with rigorous benchmarking methodol
 
 ---
 
+### Chapter 8 Bonus: Project — Building a Mixture of Experts Language Model from Scratch
+
+**Hands-on project: a complete sparse MoE LM in pure PyTorch, trained on TinyStories on a single A100**
+- The conditional-computation contract: total vs. active parameters, why sparse routing scales knowledge without scaling FLOPs
+- The expert: a single SwiGLU FFN, identical in shape across experts
+- The router: top-k gating, renormalized softmax, why top-k is non-differentiable and how gradients still flow
+- Combining experts: scatter-gather dispatch with per-expert masks and `index_add_`
+- Load balancing: expert collapse failure mode, Switch Transformer auxiliary loss, ST-MoE router z-loss
+- The MoE transformer block: pre-norm, RMSNorm, causal MHA with RoPE, MoE FFN, residuals
+- Full model: alternating dense/MoE layers, weight-tied LM head, optional shared experts (DeepSeek-style)
+- Training: TinyStories via HF `datasets`, GPT-2 BPE tokenizer, packed batches, AdamW + warmup/cosine, bf16 autocast, three-loss combine
+- Inference: KV-cache generation with top-p sampling and per-token routing log
+- Evaluation: perplexity, router entropy, dead-expert fraction, load-imbalance coefficient
+- Expert forensics: interactive utilization heatmap showing emergent specialization on punctuation, dialogue, function words, character names
+- Reference config: ~18M total / ~6M active params, 8 experts top-2 + 1 shared, ~50min on a single A100
+- Extensions: fine-grained experts, MLA, auxiliary-loss-free routing (DeepSeek V3)
+
+---
+
 ### Chapter 9: Encoder-Decoder Models
 
 **T5 (Raffel et al., 2020) — Text-to-Text Transfer Transformer**
@@ -1311,26 +1330,51 @@ and unified audio-visual models, with evaluation grounded in domain-standard met
 
 ### Chapter 27: Audio Understanding and Music Generation
 
+**Spectrogram transformers: the foundation**
+- Audio Spectrogram Transformer (AST, Gong et al., 2021): patch-based ViT on mel spectrograms, 0.485 mAP on AudioSet
+- PaSST (Koutini et al., 2021): patchout regularization, separate time/frequency positional encodings, ~2-day training on a single consumer GPU
+- HTS-AT: hierarchical token-semantic AT with token shift for memory efficiency
+- AudioSet (Google, 2017): 527 weakly-labeled classes, ~2M 10-second YouTube clips — the ImageNet of audio
+
 **Self-supervised audio pre-training**
-- Audio Spectrogram Transformer (AST): patch-based ViT applied to mel spectrograms
-- AudioMAE: masked autoencoder for audio, 80% masking, pre-trained on AudioSet
-- SSAST: joint discriminative + generative pre-training
+- AudioMAE (Huang et al., 2022): asymmetric masked autoencoder, 80% masking, pre-trained on AudioSet
+- BEATs (ICLR 2023): tokenizer-based SSL, iterative refinement of semantically rich discrete targets
+- EAT (IJCAI 2024): utterance-level + frame-level objective, ~15× faster pre-training than BEATs, ~10× faster than AudioMAE
+- Dasheng (Interspeech 2024): masked audio encoder scaled to 1.2B parameters, clean SSL scaling on general audio classification
+- OpenBEATs (2025): fully open recipe; matches or beats Dasheng on FSD50K / ESC-50 with 4× fewer parameters
+- The universal audio encoder: one backbone for speech, music, and environmental sound
 
-**Audio language models**
-- AudioLDM 2: latent diffusion with AudioMAE encoder as conditioning
-- AudioPaLM: unify speech and text in a single PaLM decoder
-- Any-to-Any: audio generation from any input modality
+**Contrastive language-audio pre-training (CLAP)**
+- Microsoft CLAP (Elizalde et al., 2022): CLIP-style dual encoder for audio and text
+- LAION-CLAP (2023): HTS-AT + RoBERTa, feature fusion for variable-length audio, LAION-Audio-630K, 89.98% zero-shot ESC-50
+- larger_clap_music: music-specialized checkpoint for genre / mood / instrument retrieval
+- Zero-shot classification and text-to-audio retrieval without fine-tuning
+- CLAP as a conditioning signal for downstream generative models (Stable Audio, MusicGen)
 
-**Music generation**
-- Jukebox (OpenAI): VQ-VAE + sparse transformer, raw audio, 1.2M parameters
-- MusicGen (Meta, 2023): single-stage decoder, EnCodec tokens, text/melody conditioning
-- MusicLM (Google, 2023): hierarchical audio LM, MuLan for text-audio alignment
-- Stable Audio: latent diffusion with long-form temporal autoencoder
+**Music generation: tokens, delays, and diffusion**
+- Jukebox (OpenAI, 2020): hierarchical VQ-VAE + sparse transformer on raw audio, historically important but minute-per-minute slow
+- MusicLM (Google, 2023): hierarchical audio LM with MuLan text-audio embedding, semantic + acoustic tokens
+- MusicGen (Meta, 2023): single-stage decoder over 32 kHz EnCodec (4 codebooks @ 50 Hz), delay pattern for parallel multi-codebook AR, text + melody conditioning, 20K hours licensed training audio
+- JASCO (Meta, 2024): joint audio-symbolic conditioning — chord, beat, and melody control
+- AudioLDM 2 (2023): latent diffusion with AudioMAE as the "language of audio", unified recipe for speech, music, and sound effects
+- Stable Audio 2.0 (Apr 2024): Diffusion Transformer (DiT) on 21.5 Hz continuous latents, 4:45 long-form generation with CLAP and timing conditioning
+- Stable Audio 2.5 (Sep 2025): enterprise-grade successor, sub-2-second generation, designed for brand and advertising use
+- YuE (Jan 2025): first open-source (Apache 2.0) full-song lyrics-to-song foundation model, dual-track in-context learning
+- Suno v5 (Sep 2025): hybrid LLM (lyrics + structure) + transformer/diffusion (audio), ELO 1293 on music arena
+- Udio v4 (2026): inpainting, stem separation, clip blending for edit-oriented workflows
 
-**Sound event detection and classification**
-- AudioSet: weakly-labeled, 527 classes, 2M clips
-- Transformer-based sound event detection: patch embedding of spectrograms
-- Zero-shot audio classification with CLAP: CLIP-like contrastive audio-text pre-training
+**Audio language models and the reasoning frontier**
+- Pengi and LTU: early instruction-tuned audio LLMs for captioning and QA
+- Qwen2-Audio, Qwen2.5-Omni, Qwen3.5-Omni (Alibaba): omni-modal LLM family; competitive on MMAU
+- Audio Flamingo 3 (NVIDIA, Jul 2025): 7B Qwen-2.5 base, LLaVA-style training, custom Whisper encoder, up to 10-minute audio; MMAU 72.42, ClothoAQA 91.1; 5.94 s voice-chat latency
+- Music Flamingo (NVIDIA, Nov 2025): 8B, fine-tuned on MF-Skills, 15-minute / 24k-token context, MF-Think chain-of-thought + GRPO, new SOTA on 10+ music benchmarks
+- Architecture pattern: audio encoder (Whisper / AST / AudioMAE) + projection / Q-former + text LLM decoder (frozen or LoRA)
+
+**Evaluation landscape (April 2026 snapshot)**
+- Classification: AudioSet mAP, ESC-50, FSD50K, SPC1/2 keyword spotting
+- LALM reasoning: MMAU, LongAudioBench, MUSE, ClothoAQA, Clotho Entailment, CMM Hallucination
+- Music generation: FAD (Fréchet Audio Distance), CLAP score, KLD, human arena Elo
+- Why music evaluation is harder: no canonical ground truth, subjective aesthetics, genre-conditioned listener expectations
 
 ---
 

@@ -1,0 +1,1077 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Chapter 8 Bonus: Project — Building a Mixture of Experts Language Model — Transformer Research Book</title>
+  <link rel="stylesheet" href="../assets/style.css">
+  <link rel="stylesheet" href="../assets/math.css">
+  <link rel="stylesheet" href="../assets/prism.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"
+    onload="renderMathInElement(document.body, {
+      delimiters: [{left: '$$', right: '$$', display: true},{left: '$', right: '$', display: false}]
+    })"></script>
+  <script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/prism.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-python.min.js"></script>
+</head>
+<body>
+  <nav class="chapter-nav">
+    <a href="../index.html" class="nav-home">← Table of Contents</a>
+    <span class="nav-chapter">Chapter 8 Bonus</span>
+    <div style="display:flex; align-items:center; gap:1rem;">
+      <button class="theme-toggle" onclick="toggleTheme()" aria-label="Toggle dark mode">
+        <span class="icon-moon">&#9789;</span><span class="icon-sun">&#9788;</span>
+      </button>
+      <a href="ch09.html" class="nav-next">Next Chapter →</a>
+    </div>
+  </nav>
+  <script>
+    function toggleTheme(){document.documentElement.classList.toggle('dark');localStorage.setItem('theme',document.documentElement.classList.contains('dark')?'dark':'light');}
+    if(localStorage.getItem('theme')==='dark')document.documentElement.classList.add('dark');
+  </script>
+  <script src="../assets/progress.js"></script>
+
+  <article class="chapter">
+
+    <header class="chapter-header">
+      <div class="chapter-number">Chapter 8 Bonus</div>
+      <h1 class="chapter-title">Project: Building a Mixture of Experts Language Model from Scratch</h1>
+      <p class="chapter-lead">Mixtral 8&times;7B has 47 billion parameters but its forward pass costs the same as a 13B dense model. DeepSeek V3 is a 671B model that activates 37B per token. That arithmetic &mdash; total parameters decoupled from active parameters &mdash; is the entire promise of sparse Mixture of Experts. The papers describe it cleanly. The actual training is a different story: routers collapse onto two experts within a hundred steps, gradients refuse to flow through the top-k operator, and the load-balance auxiliary loss has to be tuned to a tenth of a percent or the model never learns anything. By the end of this chapter you will have built a working MoE language model in pure PyTorch, trained it on TinyStories on a single A100 in under an hour, and watched expert specialization emerge in real time &mdash; one expert quietly claiming punctuation, another firing on dialogue, a third on character names &mdash; with no supervision telling them what to specialize on.</p>
+    </header>
+
+    <!-- ================================================================== -->
+    <!-- SECTION 1: The Conditional-Computation Contract -->
+    <!-- ================================================================== -->
+    <section class="chapter-section" id="the-conditional-computation-contract">
+      <h2>The Conditional-Computation Contract</h2>
+
+      <p>A dense transformer pays for every parameter on every token. Add an FFN of width $d_{ff}$ to a model and every single token in every batch flows through that FFN's $2\, d_{model}\, d_{ff}$ weights (matrix multiply, $\mathbb{R}^{n \times d_{model}} \times \mathbb{R}^{d_{model} \times d_{ff}} \to \mathbb{R}^{n \times d_{ff}}$). Capacity and compute scale together. To get a bigger model you must accept proportionally bigger FLOPs.</p>
+
+      <p>Mixture of Experts breaks that tie. Replace the single FFN with $N$ identically-shaped expert FFNs and a small <strong>router</strong> network. The router reads each token and picks the top $k$ experts for it &mdash; usually $k = 2$ out of $N = 8$. The token only flows through those $k$ experts. The other $N - k$ experts sit idle for that token. Total parameters scale with $N$. Active parameters per token scale with $k$. The reader from Chapter 8 already saw the consequences: Mixtral fits its weights in 8 expert FFNs but only uses 2 per token, so a 47B model runs as fast as a 13B one.</p>
+
+      <figure class="diagram-figure">
+        <svg width="100%" viewBox="0 0 800 320" xmlns="http://www.w3.org/2000/svg">
+          <defs>
+            <marker id="ch08b-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+              <path d="M1 1L9 5L1 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+            </marker>
+            <marker id="ch08b-arr-coral" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+              <path d="M1 1L9 5L1 9" fill="none" stroke="#993C1D" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+            </marker>
+          </defs>
+
+          <text x="400" y="22" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="14" font-weight="600" fill="#1A1A18">Sparse Dispatch: One Token, Eight Experts, Two Activated</text>
+
+          <!-- Token input -->
+          <rect x="40" y="135" width="120" height="46" rx="6" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1.5"/>
+          <text x="100" y="161" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="13" font-weight="500" fill="#0F6E56">token x</text>
+          <text x="100" y="175" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#9C9A94">d_model</text>
+
+          <!-- Router -->
+          <rect x="200" y="125" width="110" height="66" rx="6" fill="#534AB7" stroke="#534AB7"/>
+          <text x="255" y="153" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="13" font-weight="500" fill="#FFFFFF">Router</text>
+          <text x="255" y="171" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#AFA9EC">top-2 of 8</text>
+
+          <line x1="160" y1="158" x2="200" y2="158" stroke="#534AB7" stroke-width="2" marker-end="url(#ch08b-arr)"/>
+
+          <!-- 8 experts in a column -->
+          <!-- Expert 1 (inactive) -->
+          <rect x="370" y="32" width="100" height="32" rx="5" fill="#F1EFE8" stroke="#C8C6BE" stroke-width="1"/>
+          <text x="420" y="53" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="400" fill="#9C9A94">E1</text>
+
+          <!-- Expert 2 (inactive) -->
+          <rect x="370" y="68" width="100" height="32" rx="5" fill="#F1EFE8" stroke="#C8C6BE" stroke-width="1"/>
+          <text x="420" y="89" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="400" fill="#9C9A94">E2</text>
+
+          <!-- Expert 3 (ACTIVE - solid purple) -->
+          <rect x="370" y="104" width="100" height="32" rx="5" fill="#534AB7" stroke="#534AB7"/>
+          <text x="420" y="125" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="600" fill="#FFFFFF">E3 (g=0.62)</text>
+
+          <!-- Expert 4 (inactive) -->
+          <rect x="370" y="140" width="100" height="32" rx="5" fill="#F1EFE8" stroke="#C8C6BE" stroke-width="1"/>
+          <text x="420" y="161" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="400" fill="#9C9A94">E4</text>
+
+          <!-- Expert 5 (inactive) -->
+          <rect x="370" y="176" width="100" height="32" rx="5" fill="#F1EFE8" stroke="#C8C6BE" stroke-width="1"/>
+          <text x="420" y="197" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="400" fill="#9C9A94">E5</text>
+
+          <!-- Expert 6 (ACTIVE - solid purple) -->
+          <rect x="370" y="212" width="100" height="32" rx="5" fill="#534AB7" stroke="#534AB7"/>
+          <text x="420" y="233" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="600" fill="#FFFFFF">E6 (g=0.38)</text>
+
+          <!-- Expert 7 (inactive) -->
+          <rect x="370" y="248" width="100" height="32" rx="5" fill="#F1EFE8" stroke="#C8C6BE" stroke-width="1"/>
+          <text x="420" y="269" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="400" fill="#9C9A94">E7</text>
+
+          <!-- Expert 8 (inactive) -->
+          <rect x="370" y="284" width="100" height="32" rx="5" fill="#F1EFE8" stroke="#C8C6BE" stroke-width="1"/>
+          <text x="420" y="305" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="400" fill="#9C9A94">E8</text>
+
+          <!-- Router to active experts (purple solid lines) -->
+          <line x1="310" y1="148" x2="370" y2="120" stroke="#534AB7" stroke-width="2.5" marker-end="url(#ch08b-arr)"/>
+          <line x1="310" y1="170" x2="370" y2="228" stroke="#534AB7" stroke-width="2" marker-end="url(#ch08b-arr)"/>
+
+          <!-- Router to inactive experts (faint dashed) -->
+          <line x1="310" y1="135" x2="370" y2="48"  stroke="#C8C6BE" stroke-width="0.8" stroke-dasharray="3 3" opacity="0.5"/>
+          <line x1="310" y1="142" x2="370" y2="84"  stroke="#C8C6BE" stroke-width="0.8" stroke-dasharray="3 3" opacity="0.5"/>
+          <line x1="310" y1="160" x2="370" y2="156" stroke="#C8C6BE" stroke-width="0.8" stroke-dasharray="3 3" opacity="0.5"/>
+          <line x1="310" y1="175" x2="370" y2="192" stroke="#C8C6BE" stroke-width="0.8" stroke-dasharray="3 3" opacity="0.5"/>
+          <line x1="310" y1="180" x2="370" y2="264" stroke="#C8C6BE" stroke-width="0.8" stroke-dasharray="3 3" opacity="0.5"/>
+          <line x1="310" y1="183" x2="370" y2="300" stroke="#C8C6BE" stroke-width="0.8" stroke-dasharray="3 3" opacity="0.5"/>
+
+          <!-- Weighted sum node -->
+          <circle cx="580" cy="170" r="22" fill="#FAECE7" stroke="#F0997B" stroke-width="1.5"/>
+          <text x="580" y="175" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="16" font-weight="600" fill="#993C1D">&Sigma;</text>
+
+          <!-- Active experts to weighted sum (coral arrows) -->
+          <line x1="470" y1="120" x2="558" y2="160" stroke="#993C1D" stroke-width="1.8" marker-end="url(#ch08b-arr-coral)"/>
+          <line x1="470" y1="228" x2="558" y2="180" stroke="#993C1D" stroke-width="1.8" marker-end="url(#ch08b-arr-coral)"/>
+
+          <!-- Output -->
+          <rect x="640" y="148" width="120" height="46" rx="6" fill="#FAECE7" stroke="#F0997B" stroke-width="1.5"/>
+          <text x="700" y="174" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="13" font-weight="500" fill="#993C1D">y = 0.62 E3 + 0.38 E6</text>
+          <text x="700" y="188" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#9C9A94">d_model</text>
+
+          <line x1="602" y1="170" x2="640" y2="170" stroke="#993C1D" stroke-width="2" marker-end="url(#ch08b-arr-coral)"/>
+        </svg>
+        <figcaption>Figure 8B.1 &mdash; A single token enters the router (purple), which scores all 8 experts. Only the top-2 experts (E3 and E6, solid purple) execute. Their outputs are weighted by the renormalized router probabilities (0.62 and 0.38) and summed (coral) to produce the layer output. The other six experts contribute nothing to this token &mdash; they cost zero compute even though their parameters exist on the GPU.</figcaption>
+      </figure>
+
+      <p>The active-parameter accounting follows directly. For an MoE layer with $N$ experts, top-$k$ routing, and $n_s$ shared experts (always-on, used by Mixtral's successors and DeepSeek), each token sees:</p>
+
+      $$\mathrm{active\,FFN\,params\,per\,token} = (k + n_s) \cdot \bigl(2\, d_{model}\, d_{ff} + d_{model}\, d_{ff}\bigr)$$
+
+      <p>The total parameters live in $N$ routed experts plus $n_s$ shared experts plus a tiny router matrix of shape $\mathbb{R}^{d_{model} \times N}$. The ratio $(k + n_s) / (N + n_s)$ is the <strong>activation fraction</strong>: Mixtral 8&times;7B sits at $2 / 8 = 25\%$, DeepSeek V3 at $9 / 257 \approx 3.5\%$. Smaller activation fractions mean more parameters per FLOP &mdash; more knowledge stored per unit of inference cost.</p>
+
+      <figure class="diagram-figure">
+        <svg width="100%" viewBox="0 0 800 280" xmlns="http://www.w3.org/2000/svg">
+          <text x="400" y="22" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="14" font-weight="600" fill="#1A1A18">Total vs. Active Parameters &mdash; Three Real Models</text>
+
+          <!-- Y axis label -->
+          <text x="40" y="80" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#9C9A94">params (B)</text>
+
+          <!-- Y axis ticks -->
+          <line x1="80" y1="80" x2="80" y2="240" stroke="#C8C6BE" stroke-width="1"/>
+          <line x1="76" y1="80"  x2="80" y2="80"  stroke="#9C9A94" stroke-width="1"/>
+          <text x="70" y="84"  text-anchor="end" font-family="system-ui, -apple-system, sans-serif" font-size="10" fill="#9C9A94">700</text>
+          <line x1="76" y1="160" x2="80" y2="160" stroke="#9C9A94" stroke-width="1"/>
+          <text x="70" y="164" text-anchor="end" font-family="system-ui, -apple-system, sans-serif" font-size="10" fill="#9C9A94">350</text>
+          <line x1="76" y1="240" x2="80" y2="240" stroke="#9C9A94" stroke-width="1"/>
+          <text x="70" y="244" text-anchor="end" font-family="system-ui, -apple-system, sans-serif" font-size="10" fill="#9C9A94">0</text>
+
+          <!-- LLaMA 3 70B (dense) -->
+          <rect x="140" y="224" width="50" height="16" fill="#0F6E56" stroke="#0F6E56"/>
+          <rect x="200" y="224" width="50" height="16" fill="#993C1D" stroke="#993C1D"/>
+          <text x="195" y="258" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="500" fill="#1A1A18">LLaMA 3 70B</text>
+          <text x="195" y="272" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#9C9A94">dense (100% active)</text>
+
+          <!-- Mixtral 8x7B -->
+          <rect x="320" y="229" width="50" height="11" fill="#0F6E56" stroke="#0F6E56"/>
+          <rect x="380" y="237" width="50" height="3"  fill="#993C1D" stroke="#993C1D"/>
+          <text x="375" y="258" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="500" fill="#1A1A18">Mixtral 8&times;7B</text>
+          <text x="375" y="272" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#9C9A94">47B total &middot; 13B active (28%)</text>
+
+          <!-- DeepSeek V3 -->
+          <rect x="500" y="86"  width="50" height="154" fill="#0F6E56" stroke="#0F6E56"/>
+          <rect x="560" y="232" width="50" height="8"   fill="#993C1D" stroke="#993C1D"/>
+          <text x="555" y="258" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="500" fill="#1A1A18">DeepSeek V3</text>
+          <text x="555" y="272" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#9C9A94">671B total &middot; 37B active (5.5%)</text>
+
+          <!-- Legend -->
+          <rect x="660" y="86"  width="14" height="14" fill="#0F6E56"/>
+          <text x="680" y="98"  font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="400" fill="#5C5B56">total params</text>
+          <rect x="660" y="108" width="14" height="14" fill="#993C1D"/>
+          <text x="680" y="120" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="400" fill="#5C5B56">active per token</text>
+        </svg>
+        <figcaption>Figure 8B.2 &mdash; The activation ratio defines the MoE win. Dense models pay for every parameter on every token. Mixtral pays for 28%. DeepSeek V3 pays for 5.5%. The teal bar is the model's stored knowledge; the coral bar is the per-token compute. The wider that gap, the more knowledge you can serve per dollar of inference.</figcaption>
+      </figure>
+
+      <p>The rest of this chapter is an honest implementation of that machinery. We will build each component &mdash; expert, router, dispatch, load-balance loss, full block, training loop, KV-cache inference, evaluation &mdash; in a few hundred lines of pure PyTorch. The point is not a production-grade kernel; it is a model you can step through with a debugger and modify in a single file.</p>
+    </section>
+
+    <!-- ================================================================== -->
+    <!-- SECTION 2: The Expert -->
+    <!-- ================================================================== -->
+    <section class="chapter-section" id="the-expert">
+      <h2>The Expert: One SwiGLU FFN</h2>
+
+      <p>An expert in a modern MoE is just a feed-forward network. There is no architectural difference between an expert and the FFN inside a dense LLaMA block &mdash; same SwiGLU activation, same linear layers, same shape. What differs is that there are $N$ of them and a router that picks which ones run.</p>
+
+      <p>SwiGLU (Shazeer, 2020) is the activation that LLaMA, Mistral, Mixtral, and DeepSeek all use. It is a gated variant of Swish. Given input $x \in \mathbb{R}^{d_{model}}$ and three weight matrices $W_1, W_3 \in \mathbb{R}^{d_{model} \times d_{ff}}$ and $W_2 \in \mathbb{R}^{d_{ff} \times d_{model}}$:</p>
+
+      $$E(x) = (\mathrm{SiLU}(x W_1) \odot x W_3)\, W_2$$
+
+      <p>The juxtaposition $x W_1$ is matrix multiply (in the per-token view, vector $\times$ matrix, $\mathbb{R}^{d_{model}} \times \mathbb{R}^{d_{model} \times d_{ff}} \to \mathbb{R}^{d_{ff}}$). The $\odot$ is element-wise multiplication (Hadamard product, both operands $\in \mathbb{R}^{d_{ff}}$): $W_3$ produces a gate that the SiLU branch is multiplied against, dimension-by-dimension. The final $W_2$ projects back to $d_{model}$. The cost is three projections instead of two &mdash; SwiGLU spends 1.5&times; the FLOPs of a vanilla ReLU FFN at the same $d_{ff}$, which is why papers often quote SwiGLU FFNs at $d_{ff} = \tfrac{2}{3} \cdot 4\, d_{model}$ to keep the parameter count comparable.</p>
+
+<pre><code class="language-python">
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class SwiGLUExpert(nn.Module):
+    """A single expert: a SwiGLU feed-forward network. Identical in shape
+    to a LLaMA / Mixtral FFN — what makes it an 'expert' is that there are
+    N of them and a router decides which ones run for each token."""
+    def __init__(self, d_model: int, d_ff: int):
+        super().__init__()
+        self.w1 = nn.Linear(d_model, d_ff, bias=False)  # gate-up branch
+        self.w3 = nn.Linear(d_model, d_ff, bias=False)  # value-up branch
+        self.w2 = nn.Linear(d_ff, d_model, bias=False)  # down
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (..., d_model) — works on (B, T, d) or flattened (BT, d)
+        gate = F.silu(self.w1(x))                       # (..., d_ff)
+        value = self.w3(x)                              # (..., d_ff)
+        return self.w2(gate * value)                    # (..., d_model)
+</code></pre>
+
+      <p>One detail worth noting: the expert takes inputs of arbitrary leading shape. We will exploit this in Section 4 by flattening a $(B, T, d_{model})$ batch into $(BT, d_{model})$ and feeding each expert only the rows of tokens that the router assigned to it. The expert does not care &mdash; its forward pass is just three matrix multiplies and an element-wise gate.</p>
+    </section>
+
+    <!-- ================================================================== -->
+    <!-- SECTION 3: The Router -->
+    <!-- ================================================================== -->
+    <section class="chapter-section" id="the-router">
+      <h2>The Router: Top-k Gating</h2>
+
+      <p>The router is the smallest module in the model and the hardest to train. It is a single linear layer of shape $\mathbb{R}^{d_{model} \times N}$ that produces $N$ logits per token &mdash; one score per expert. We then pick the top $k$ scores, renormalize them with a softmax, and use those $k$ weights to combine the chosen experts' outputs.</p>
+
+      $$g(x) = \mathrm{softmax}_k\bigl(\mathrm{top\text{-}}k(x W_g)\bigr) \in \mathbb{R}^{k}$$
+
+      <p>Three subtleties worth pausing on. First, the softmax is over the selected $k$ logits, not all $N$. This is the Switch Transformer convention: the chosen experts' weights sum to one regardless of how confidently they were chosen. Second, the top-$k$ operation is non-differentiable &mdash; it is a hard selection, not a soft attention. Gradients flow into the gate only through the $k$ weights that were actually used; the other $N - k$ logits get no gradient signal from this token. Third, the gate weight $g_i(x)$ is a scalar that scales the corresponding expert output $E_i(x)$: $g_i(x)\, E_i(x)$ is scalar times vector, the standard scalar multiplication.</p>
+
+      <figure class="diagram-figure">
+        <svg width="100%" viewBox="0 0 800 320" xmlns="http://www.w3.org/2000/svg">
+          <defs>
+            <marker id="ch08b-arr2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
+              <path d="M1 1L9 5L1 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+            </marker>
+          </defs>
+
+          <text x="400" y="22" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="14" font-weight="600" fill="#1A1A18">From Token to Top-2 Routing Decision</text>
+
+          <!-- Token vector -->
+          <rect x="40" y="140" width="100" height="44" rx="6" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1.5"/>
+          <text x="90" y="166" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="13" font-weight="500" fill="#0F6E56">x</text>
+          <text x="90" y="180" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#9C9A94">d_model = 256</text>
+
+          <line x1="140" y1="162" x2="170" y2="162" stroke="#9C9A94" stroke-width="1.5" marker-end="url(#ch08b-arr2)"/>
+
+          <!-- Gate matrix -->
+          <rect x="170" y="130" width="80" height="64" rx="6" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1.5"/>
+          <text x="210" y="158" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="13" font-weight="500" fill="#534AB7">W_g</text>
+          <text x="210" y="174" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#9C9A94">256&times;8</text>
+          <text x="210" y="188" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#9C9A94">linear</text>
+
+          <line x1="250" y1="162" x2="290" y2="162" stroke="#9C9A94" stroke-width="1.5" marker-end="url(#ch08b-arr2)"/>
+
+          <!-- Logits over 8 experts -->
+          <text x="295" y="80" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#9C9A94">raw logits</text>
+          <!-- 8 vertical bars sized by logit value -->
+          <rect x="295" y="120" width="22" height="80" fill="#AFA9EC" stroke="#534AB7" stroke-width="1"/>
+          <text x="306" y="218" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" fill="#9C9A94">E1</text>
+          <text x="306" y="115" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" fill="#5C5B56">1.2</text>
+
+          <rect x="320" y="160" width="22" height="40" fill="#AFA9EC" stroke="#534AB7" stroke-width="1"/>
+          <text x="331" y="218" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" fill="#9C9A94">E2</text>
+          <text x="331" y="155" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" fill="#5C5B56">0.4</text>
+
+          <!-- E3 - top -->
+          <rect x="345" y="80"  width="22" height="120" fill="#534AB7" stroke="#534AB7"/>
+          <text x="356" y="218" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="600" fill="#534AB7">E3</text>
+          <text x="356" y="75"  text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="600" fill="#534AB7">2.7</text>
+
+          <rect x="370" y="180" width="22" height="20" fill="#AFA9EC" stroke="#534AB7" stroke-width="1"/>
+          <text x="381" y="218" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" fill="#9C9A94">E4</text>
+          <text x="381" y="175" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" fill="#5C5B56">0.1</text>
+
+          <rect x="395" y="170" width="22" height="30" fill="#AFA9EC" stroke="#534AB7" stroke-width="1"/>
+          <text x="406" y="218" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" fill="#9C9A94">E5</text>
+          <text x="406" y="165" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" fill="#5C5B56">0.3</text>
+
+          <!-- E6 - second top -->
+          <rect x="420" y="100" width="22" height="100" fill="#534AB7" stroke="#534AB7"/>
+          <text x="431" y="218" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="600" fill="#534AB7">E6</text>
+          <text x="431" y="95"  text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="600" fill="#534AB7">2.2</text>
+
+          <rect x="445" y="155" width="22" height="45" fill="#AFA9EC" stroke="#534AB7" stroke-width="1"/>
+          <text x="456" y="218" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" fill="#9C9A94">E7</text>
+          <text x="456" y="150" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" fill="#5C5B56">0.5</text>
+
+          <rect x="470" y="175" width="22" height="25" fill="#AFA9EC" stroke="#534AB7" stroke-width="1"/>
+          <text x="481" y="218" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" fill="#9C9A94">E8</text>
+          <text x="481" y="170" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" fill="#5C5B56">0.2</text>
+
+          <!-- arrow to renormalized weights -->
+          <line x1="500" y1="162" x2="540" y2="162" stroke="#534AB7" stroke-width="2" marker-end="url(#ch08b-arr2)"/>
+          <text x="520" y="150" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="500" fill="#534AB7">top-2 + softmax</text>
+
+          <!-- Renormalized output -->
+          <rect x="555" y="135" width="100" height="32" rx="5" fill="#534AB7" stroke="#534AB7"/>
+          <text x="605" y="156" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="600" fill="#FFFFFF">E3: 0.62</text>
+
+          <rect x="555" y="172" width="100" height="32" rx="5" fill="#534AB7" stroke="#534AB7"/>
+          <text x="605" y="193" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="600" fill="#FFFFFF">E6: 0.38</text>
+
+          <text x="660" y="158" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#9C9A94">sum = 1.00</text>
+          <text x="660" y="195" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#9C9A94">others: 0</text>
+
+          <text x="400" y="265" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-style="italic" fill="#5C5B56">The renormalized softmax is taken over only the selected k logits, not all N.</text>
+          <text x="400" y="282" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-style="italic" fill="#5C5B56">Gradients flow only through the chosen experts &mdash; the others see no signal from this token.</text>
+        </svg>
+        <figcaption>Figure 8B.3 &mdash; A token's vector is projected to 8 logits, one per expert. The top-2 logits (E3 = 2.7, E6 = 2.2) are kept; the rest are masked. A softmax over only those two produces the final routing weights (0.62, 0.38) that sum to one. This is the entire routing decision &mdash; one matrix multiply, one top-k, one softmax.</figcaption>
+      </figure>
+
+<pre><code class="language-python">
+class TopKRouter(nn.Module):
+    """Top-k softmax router. Returns the chosen expert indices, the
+    renormalized routing weights, and the full routing probabilities
+    (which the load-balance loss needs)."""
+    def __init__(self, d_model: int, n_experts: int, k: int):
+        super().__init__()
+        self.n_experts = n_experts
+        self.k = k
+        self.gate = nn.Linear(d_model, n_experts, bias=False)
+
+    def forward(self, x_flat: torch.Tensor):
+        # x_flat: (BT, d_model) — a flat batch of tokens
+        logits = self.gate(x_flat)                          # (BT, n_experts)
+
+        # Full softmax over ALL experts — needed for the load-balance loss
+        full_probs = F.softmax(logits, dim=-1)              # (BT, n_experts)
+
+        # Top-k selection then renormalize over the selected k
+        topk_logits, topk_idx = logits.topk(self.k, dim=-1) # both (BT, k)
+        topk_weights = F.softmax(topk_logits, dim=-1)       # (BT, k), rows sum to 1
+
+        return topk_idx, topk_weights, full_probs, logits
+</code></pre>
+
+      <p>We return four tensors. The pair <code>(topk_idx, topk_weights)</code> is what dispatch needs. The <code>full_probs</code> tensor is what the load-balance loss needs &mdash; it has to see the soft routing distribution over all $N$ experts, not just the chosen $k$, to push the average mass toward uniform. The raw <code>logits</code> are what the router z-loss needs to penalize. We will get to both losses in Section 5.</p>
+    </section>
+
+    <!-- ================================================================== -->
+    <!-- SECTION 4: Combining Experts -->
+    <!-- ================================================================== -->
+    <section class="chapter-section" id="combining-experts">
+      <h2>Combining Experts: The Scatter-Gather Dispatch</h2>
+
+      <p>The router has produced, for each of $BT$ tokens, the indices of $k$ experts and a weight per expert. Now we have to actually run those experts and assemble the output. There are roughly three ways to do this. The fast way uses a fused kernel like Megablocks that turns the dispatch into one big block-sparse matrix multiply. The naive way runs each expert on the full batch and zeros out the irrelevant rows &mdash; trivial to write but throws away the FLOPs win. The middle way, which we will use, loops over experts and feeds each one only the rows of tokens that selected it.</p>
+
+      <p>The pattern is straightforward. Flatten the $(B, T, d_{model})$ activations into $(BT, d_{model})$. For each expert $i$, find the rows where $i$ appears in the top-$k$ indices, gather just those rows, run the expert, multiply by the corresponding routing weights, and scatter-add the results back into a zero buffer. Each token contributes $k$ additions to the output buffer &mdash; one per expert it routed to.</p>
+
+<pre><code class="language-python">
+class MoELayer(nn.Module):
+    """Routes each token to its top-k experts and combines outputs.
+    Pedagogically clear loop-over-experts dispatch; not a fast kernel."""
+    def __init__(self, d_model: int, d_ff: int, n_experts: int, k: int,
+                 n_shared: int = 0):
+        super().__init__()
+        self.n_experts = n_experts
+        self.k = k
+        self.router = TopKRouter(d_model, n_experts, k)
+        self.experts = nn.ModuleList(
+            [SwiGLUExpert(d_model, d_ff) for _ in range(n_experts)]
+        )
+        # Shared experts (DeepSeek-style): always active for every token
+        self.shared = nn.ModuleList(
+            [SwiGLUExpert(d_model, d_ff) for _ in range(n_shared)]
+        )
+
+    def forward(self, x: torch.Tensor):
+        B, T, D = x.shape
+        x_flat = x.reshape(B * T, D)                          # (BT, D)
+
+        topk_idx, topk_w, full_probs, logits = self.router(x_flat)
+        # topk_idx: (BT, k)   topk_w: (BT, k)
+        # full_probs: (BT, n_experts)   logits: (BT, n_experts)
+
+        out = torch.zeros_like(x_flat)                        # (BT, D)
+        for i, expert in enumerate(self.experts):
+            # Find every (token, slot) where expert i was chosen
+            mask = (topk_idx == i)                            # (BT, k) bool
+            tok_idx, slot_idx = mask.nonzero(as_tuple=True)   # both (M,)
+            if tok_idx.numel() == 0:
+                continue                                      # this expert is dead this batch
+            tokens = x_flat[tok_idx]                          # (M, D)
+            weights = topk_w[tok_idx, slot_idx].unsqueeze(-1) # (M, 1)
+            out.index_add_(0, tok_idx, weights * expert(tokens))  # scalar*vec, scatter-add
+
+        # Shared experts run on every token (no routing)
+        for sh in self.shared:
+            out = out + sh(x_flat)
+
+        return out.reshape(B, T, D), full_probs, logits, topk_idx
+</code></pre>
+
+      <p>Three subtleties to read carefully. The <code>mask.nonzero</code> call gives us, for expert $i$, every $(token, slot)$ pair where expert $i$ appeared as the token's slot-th choice. The <code>weights</code> tensor for that expert is then the routing weight assigned at that exact slot &mdash; a scalar per token. The <code>index_add_</code> writes the weighted expert output back to the right token row, and the <em>add</em> matters: a token routed to two experts will receive two writes that sum into the correct $\sum_{i \in \mathcal{T}_k(x)} g_i(x)\, E_i(x)$ output. Shared experts, when present, run on every token outside the routing loop &mdash; they always fire and always contribute $E^{\text{sh}}(x)$ to the sum.</p>
+
+      <p>This loop is $O(N)$ in expert count, which is fine for our $N = 8$ but would be wasteful for DeepSeek's $N = 256$. Production frameworks replace it with a permuted block-sparse matmul that issues a single GEMM. The math &mdash; what gets computed &mdash; is identical.</p>
+    </section>
+
+    <!-- ================================================================== -->
+    <!-- SECTION 5: Load Balancing -->
+    <!-- ================================================================== -->
+    <section class="chapter-section" id="load-balancing">
+      <h2>Load Balancing: The Reason MoE Training Actually Works</h2>
+
+      <p>Train the model we have built so far for a hundred steps and look at expert usage. The histogram does not look uniform. Two experts will be hoarding 90% of the routed tokens, and the other six will receive almost nothing. Within another few hundred steps those starved experts have effectively stopped learning &mdash; they get no gradient signal, their weights drift, the router stops choosing them, and they become permanent dead weight on the GPU.</p>
+
+      <p>This is <strong>expert collapse</strong>, and it is the central failure mode of MoE training. The mechanism is a positive feedback loop. The router slightly favors expert 3 by chance. Expert 3 sees more tokens, gets more gradient updates, becomes better at processing the kinds of tokens it has seen. The router learns to send those tokens to expert 3 with even higher confidence. The other experts process fewer tokens, fall behind, and the router routes around them more aggressively. Within a few thousand steps the model has effectively become a dense network running expert 3 with two extra dead modules attached.</p>
+
+      <figure class="diagram-figure">
+        <svg width="100%" viewBox="0 0 800 320" xmlns="http://www.w3.org/2000/svg">
+          <text x="400" y="22" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="14" font-weight="600" fill="#1A1A18">Expert Usage Histogram &mdash; Same Model, With and Without Aux Loss</text>
+
+          <!-- Left panel: Without aux loss -->
+          <rect x="20" y="42" width="370" height="34" rx="5" fill="#FAECE7" stroke="#F0997B" stroke-width="1"/>
+          <text x="205" y="64" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="13" font-weight="600" fill="#993C1D">Without aux loss &mdash; expert collapse</text>
+
+          <!-- Bars: 2 experts hoard, 6 starve -->
+          <line x1="40"  y1="270" x2="380" y2="270" stroke="#9C9A94" stroke-width="1"/>
+          <text x="40" y="284" font-family="system-ui, -apple-system, sans-serif" font-size="10" fill="#9C9A94">E1</text>
+          <text x="80" y="284" font-family="system-ui, -apple-system, sans-serif" font-size="10" fill="#9C9A94">E2</text>
+          <text x="120" y="284" font-family="system-ui, -apple-system, sans-serif" font-size="10" fill="#9C9A94">E3</text>
+          <text x="160" y="284" font-family="system-ui, -apple-system, sans-serif" font-size="10" fill="#9C9A94">E4</text>
+          <text x="200" y="284" font-family="system-ui, -apple-system, sans-serif" font-size="10" fill="#9C9A94">E5</text>
+          <text x="240" y="284" font-family="system-ui, -apple-system, sans-serif" font-size="10" fill="#9C9A94">E6</text>
+          <text x="280" y="284" font-family="system-ui, -apple-system, sans-serif" font-size="10" fill="#9C9A94">E7</text>
+          <text x="320" y="284" font-family="system-ui, -apple-system, sans-serif" font-size="10" fill="#9C9A94">E8</text>
+
+          <!-- Tiny bars for starved experts -->
+          <rect x="35"  y="262" width="22" height="8"  fill="#EF9F27" stroke="#854F0B" stroke-width="0.5"/>
+          <rect x="75"  y="264" width="22" height="6"  fill="#EF9F27" stroke="#854F0B" stroke-width="0.5"/>
+          <rect x="115" y="100" width="22" height="170" fill="#534AB7" stroke="#534AB7"/>
+          <rect x="155" y="265" width="22" height="5"  fill="#EF9F27" stroke="#854F0B" stroke-width="0.5"/>
+          <rect x="195" y="266" width="22" height="4"  fill="#EF9F27" stroke="#854F0B" stroke-width="0.5"/>
+          <rect x="235" y="120" width="22" height="150" fill="#534AB7" stroke="#534AB7"/>
+          <rect x="275" y="263" width="22" height="7"  fill="#EF9F27" stroke="#854F0B" stroke-width="0.5"/>
+          <rect x="315" y="264" width="22" height="6"  fill="#EF9F27" stroke="#854F0B" stroke-width="0.5"/>
+
+          <text x="46"  y="258" font-family="system-ui, -apple-system, sans-serif" font-size="9" fill="#854F0B">2%</text>
+          <text x="86"  y="260" font-family="system-ui, -apple-system, sans-serif" font-size="9" fill="#854F0B">1%</text>
+          <text x="123" y="95"  font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="600" fill="#534AB7">48%</text>
+          <text x="166" y="261" font-family="system-ui, -apple-system, sans-serif" font-size="9" fill="#854F0B">1%</text>
+          <text x="206" y="262" font-family="system-ui, -apple-system, sans-serif" font-size="9" fill="#854F0B">1%</text>
+          <text x="243" y="115" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="600" fill="#534AB7">42%</text>
+          <text x="284" y="259" font-family="system-ui, -apple-system, sans-serif" font-size="9" fill="#854F0B">2%</text>
+          <text x="324" y="260" font-family="system-ui, -apple-system, sans-serif" font-size="9" fill="#854F0B">2%</text>
+
+          <text x="205" y="304" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-style="italic" fill="#993C1D">2 experts hold 90% of tokens; 6 are dead</text>
+
+          <!-- Vertical divider -->
+          <line x1="400" y1="42" x2="400" y2="290" stroke="#E5E3DC" stroke-width="1" stroke-dasharray="5 4"/>
+
+          <!-- Right panel: With aux loss -->
+          <rect x="410" y="42" width="370" height="34" rx="5" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1"/>
+          <text x="595" y="64" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="13" font-weight="600" fill="#0F6E56">With aux loss + z-loss &mdash; balanced</text>
+
+          <line x1="430" y1="270" x2="770" y2="270" stroke="#9C9A94" stroke-width="1"/>
+          <text x="430" y="284" font-family="system-ui, -apple-system, sans-serif" font-size="10" fill="#9C9A94">E1</text>
+          <text x="470" y="284" font-family="system-ui, -apple-system, sans-serif" font-size="10" fill="#9C9A94">E2</text>
+          <text x="510" y="284" font-family="system-ui, -apple-system, sans-serif" font-size="10" fill="#9C9A94">E3</text>
+          <text x="550" y="284" font-family="system-ui, -apple-system, sans-serif" font-size="10" fill="#9C9A94">E4</text>
+          <text x="590" y="284" font-family="system-ui, -apple-system, sans-serif" font-size="10" fill="#9C9A94">E5</text>
+          <text x="630" y="284" font-family="system-ui, -apple-system, sans-serif" font-size="10" fill="#9C9A94">E6</text>
+          <text x="670" y="284" font-family="system-ui, -apple-system, sans-serif" font-size="10" fill="#9C9A94">E7</text>
+          <text x="710" y="284" font-family="system-ui, -apple-system, sans-serif" font-size="10" fill="#9C9A94">E8</text>
+
+          <rect x="425" y="220" width="22" height="50" fill="#534AB7" stroke="#534AB7"/>
+          <rect x="465" y="215" width="22" height="55" fill="#534AB7" stroke="#534AB7"/>
+          <rect x="505" y="205" width="22" height="65" fill="#534AB7" stroke="#534AB7"/>
+          <rect x="545" y="220" width="22" height="50" fill="#534AB7" stroke="#534AB7"/>
+          <rect x="585" y="225" width="22" height="45" fill="#534AB7" stroke="#534AB7"/>
+          <rect x="625" y="215" width="22" height="55" fill="#534AB7" stroke="#534AB7"/>
+          <rect x="665" y="218" width="22" height="52" fill="#534AB7" stroke="#534AB7"/>
+          <rect x="705" y="222" width="22" height="48" fill="#534AB7" stroke="#534AB7"/>
+
+          <text x="436" y="215" font-family="system-ui, -apple-system, sans-serif" font-size="9" fill="#534AB7">12%</text>
+          <text x="476" y="210" font-family="system-ui, -apple-system, sans-serif" font-size="9" fill="#534AB7">14%</text>
+          <text x="516" y="200" font-family="system-ui, -apple-system, sans-serif" font-size="9" fill="#534AB7">16%</text>
+          <text x="556" y="215" font-family="system-ui, -apple-system, sans-serif" font-size="9" fill="#534AB7">12%</text>
+          <text x="596" y="220" font-family="system-ui, -apple-system, sans-serif" font-size="9" fill="#534AB7">11%</text>
+          <text x="636" y="210" font-family="system-ui, -apple-system, sans-serif" font-size="9" fill="#534AB7">14%</text>
+          <text x="676" y="213" font-family="system-ui, -apple-system, sans-serif" font-size="9" fill="#534AB7">13%</text>
+          <text x="716" y="217" font-family="system-ui, -apple-system, sans-serif" font-size="9" fill="#534AB7">12%</text>
+
+          <text x="595" y="304" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-style="italic" fill="#0F6E56">All 8 experts within 2&times; of uniform; specialization can emerge</text>
+        </svg>
+        <figcaption>Figure 8B.4 &mdash; The same 8-expert MoE after 1000 training steps, with and without the load-balance auxiliary loss. Without it (left), expert collapse: two experts hold 90% of the tokens and six are starved into dead weight. With aux loss + router z-loss (right), token mass is distributed within roughly 2&times; of uniform (12.5% each) and every expert continues to receive useful gradient signal.</figcaption>
+      </figure>
+
+      <p>The fix Switch Transformer introduced is an auxiliary loss that the model trains <em>against</em>. Let $f_i$ be the fraction of tokens that selected expert $i$ in the current batch (a hard count, divided by $BT$), and let $P_i$ be the mean of the full router probability for expert $i$ across the batch (a soft mean of the softmax outputs):</p>
+
+      $$\mathcal{L}_{\text{aux}} = \alpha\, N \sum_{i=1}^{N} f_i\, P_i$$
+
+      <p>The product $f_i\, P_i$ is small when both quantities are small (an expert that is both rarely chosen and rarely confident). It is large when both are large (a hoarder). The sum is minimized when both $f_i$ and $P_i$ are uniform over $i$, in which case it equals $1/N$. The factor $N$ normalizes so the loss has unit value at the uniform optimum, and $\alpha$ is a small mixing coefficient (typically $0.01$). Crucially, $P_i$ is differentiable through the softmax, so this loss has a real gradient pulling the router toward balance &mdash; even though $f_i$ itself is not differentiable.</p>
+
+      <p>The second loss is the <strong>router z-loss</strong> (ST-MoE, Zoph 2022). The router's pre-softmax logits can drift to extreme values, which causes both the softmax to saturate (killing gradients to the non-top-$k$ experts) and bf16 underflow / overflow:</p>
+
+      $$\mathcal{L}_z = \frac{1}{BT}\sum_{b,t}\Bigl(\log \textstyle\sum_{j=1}^{N} e^{x_{b,t,j}}\Bigr)^{\!2}$$
+
+      <p>This penalizes the squared log-sum-exp of the router logits per token. It costs the model nothing in expressivity &mdash; the softmax is shift-invariant, so subtracting any constant from all logits leaves routing unchanged &mdash; but it keeps the raw logits from drifting in absolute magnitude. Mixing coefficient $\beta = 0.001$ is the published default.</p>
+
+<pre><code class="language-python">
+def load_balance_loss(full_probs: torch.Tensor, topk_idx: torch.Tensor,
+                      n_experts: int) -> torch.Tensor:
+    """Switch Transformer auxiliary load-balance loss.
+       full_probs: (BT, n_experts)  router softmax over all experts
+       topk_idx:   (BT, k)          chosen expert ids per token
+       Returns scalar; multiply by alpha (e.g. 0.01) before summing."""
+    BT = full_probs.size(0)
+    # f_i: fraction of tokens that picked expert i (in any of their k slots)
+    one_hot = F.one_hot(topk_idx, n_experts).float()  # (BT, k, n_experts)
+    f = one_hot.sum(dim=(0, 1)) / BT                  # (n_experts,)
+    # P_i: mean router probability for expert i
+    P = full_probs.mean(dim=0)                        # (n_experts,)
+    # n_experts * sum(f_i * P_i) — minimum value is 1.0 at uniform routing
+    return n_experts * (f * P).sum()
+
+def router_z_loss(logits: torch.Tensor) -> torch.Tensor:
+    """ST-MoE router z-loss. Penalizes large absolute router logits.
+       logits: (BT, n_experts)
+       Returns scalar; multiply by beta (e.g. 0.001) before summing."""
+    log_z = torch.logsumexp(logits, dim=-1)           # (BT,)
+    return (log_z ** 2).mean()
+</code></pre>
+
+      <p>Two implementation notes that are easy to get wrong. First, $f_i$ uses <em>both</em> top-$k$ slots: a token routed to experts 3 and 6 contributes to $f_3$ and $f_6$. The one-hot sum across the slot dimension takes care of this. Second, $P_i$ is computed on the full softmax over all $N$ experts, not the renormalized top-$k$ weights &mdash; the load-balance signal needs to know what the router <em>would have</em> assigned to the unchosen experts, not just how it allocated mass among the chosen ones.</p>
+    </section>
+
+    <!-- ================================================================== -->
+    <!-- SECTION 6: The MoE Block and Full Model -->
+    <!-- ================================================================== -->
+    <section class="chapter-section" id="the-moe-block-and-model">
+      <h2>The MoE Transformer Block and the Full Model</h2>
+
+      <p>An MoE transformer block is just a standard pre-norm transformer block with the dense FFN swapped for an <code>MoELayer</code>. Everything else &mdash; RMSNorm, causal multi-head attention with rotary position embeddings, the residual structure &mdash; is unchanged from a LLaMA or Mistral block (covered in detail in Chapter 8). We will write a compact version of the block here for completeness, then assemble the full language model.</p>
+
+      <figure class="diagram-figure">
+        <svg width="100%" viewBox="0 0 800 480" xmlns="http://www.w3.org/2000/svg">
+          <defs>
+            <marker id="ch08b-arr3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
+              <path d="M1 1L9 5L1 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+            </marker>
+          </defs>
+
+          <text x="400" y="22" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="14" font-weight="600" fill="#1A1A18">Pre-Norm MoE Transformer Block</text>
+
+          <!-- Input -->
+          <rect x="280" y="44" width="240" height="34" rx="6" fill="#E1F5EE" stroke="#5DCAA5" stroke-width="1.5"/>
+          <text x="400" y="65" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="13" font-weight="500" fill="#0F6E56">x  (B, T, d_model)</text>
+
+          <line x1="400" y1="78" x2="400" y2="98" stroke="#9C9A94" stroke-width="1.5" marker-end="url(#ch08b-arr3)"/>
+
+          <!-- RMSNorm 1 -->
+          <rect x="280" y="100" width="240" height="30" rx="6" fill="#FFFFFF" stroke="#C8C6BE" stroke-width="1"/>
+          <text x="400" y="119" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="500" fill="#5C5B56">RMSNorm</text>
+
+          <line x1="400" y1="130" x2="400" y2="148" stroke="#9C9A94" stroke-width="1.5" marker-end="url(#ch08b-arr3)"/>
+
+          <!-- Causal MHA -->
+          <rect x="280" y="150" width="240" height="48" rx="6" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="1.5"/>
+          <text x="400" y="173" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="13" font-weight="500" fill="#534AB7">Causal Multi-Head Attention</text>
+          <text x="400" y="189" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#9C9A94">RoPE on q, k &middot; KV cache at inference</text>
+
+          <!-- Residual 1 -->
+          <line x1="200" y1="62" x2="200" y2="218" stroke="#5DCAA5" stroke-width="1.5"/>
+          <line x1="200" y1="62"  x2="280" y2="62"  stroke="#5DCAA5" stroke-width="1.5"/>
+          <line x1="200" y1="218" x2="380" y2="218" stroke="#5DCAA5" stroke-width="1.5" marker-end="url(#ch08b-arr3)"/>
+          <text x="160" y="142" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#0F6E56">residual</text>
+
+          <!-- + node -->
+          <circle cx="400" cy="218" r="14" fill="#FFFFFF" stroke="#5C5B56" stroke-width="1.2"/>
+          <text x="400" y="223" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="14" font-weight="600" fill="#5C5B56">+</text>
+
+          <line x1="400" y1="232" x2="400" y2="252" stroke="#9C9A94" stroke-width="1.5" marker-end="url(#ch08b-arr3)"/>
+
+          <!-- RMSNorm 2 -->
+          <rect x="280" y="254" width="240" height="30" rx="6" fill="#FFFFFF" stroke="#C8C6BE" stroke-width="1"/>
+          <text x="400" y="273" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="12" font-weight="500" fill="#5C5B56">RMSNorm</text>
+
+          <line x1="400" y1="284" x2="400" y2="302" stroke="#9C9A94" stroke-width="1.5" marker-end="url(#ch08b-arr3)"/>
+
+          <!-- MoE Layer (replaces dense FFN) -->
+          <rect x="200" y="304" width="400" height="98" rx="8" fill="#EEEDFE" stroke="#534AB7" stroke-width="2"/>
+          <text x="400" y="324" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="13" font-weight="600" fill="#534AB7">MoE Layer  &mdash;  N experts, top-k routing</text>
+
+          <!-- Mini router + expert grid inside -->
+          <rect x="220" y="336" width="60" height="44" rx="4" fill="#534AB7" stroke="#534AB7"/>
+          <text x="250" y="361" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#FFFFFF">Router</text>
+
+          <line x1="280" y1="358" x2="310" y2="358" stroke="#534AB7" stroke-width="1.5" marker-end="url(#ch08b-arr3)"/>
+
+          <!-- 8 mini experts -->
+          <rect x="318" y="338" width="36" height="18" rx="3" fill="#FFFFFF" stroke="#AFA9EC" stroke-width="1"/>
+          <text x="336" y="351" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" fill="#5C5B56">E1</text>
+          <rect x="358" y="338" width="36" height="18" rx="3" fill="#534AB7" stroke="#534AB7"/>
+          <text x="376" y="351" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="600" fill="#FFFFFF">E2</text>
+          <rect x="398" y="338" width="36" height="18" rx="3" fill="#FFFFFF" stroke="#AFA9EC" stroke-width="1"/>
+          <text x="416" y="351" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" fill="#5C5B56">E3</text>
+          <rect x="438" y="338" width="36" height="18" rx="3" fill="#FFFFFF" stroke="#AFA9EC" stroke-width="1"/>
+          <text x="456" y="351" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" fill="#5C5B56">E4</text>
+          <rect x="318" y="360" width="36" height="18" rx="3" fill="#FFFFFF" stroke="#AFA9EC" stroke-width="1"/>
+          <text x="336" y="373" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" fill="#5C5B56">E5</text>
+          <rect x="358" y="360" width="36" height="18" rx="3" fill="#FFFFFF" stroke="#AFA9EC" stroke-width="1"/>
+          <text x="376" y="373" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" fill="#5C5B56">E6</text>
+          <rect x="398" y="360" width="36" height="18" rx="3" fill="#534AB7" stroke="#534AB7"/>
+          <text x="416" y="373" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="600" fill="#FFFFFF">E7</text>
+          <rect x="438" y="360" width="36" height="18" rx="3" fill="#FFFFFF" stroke="#AFA9EC" stroke-width="1"/>
+          <text x="456" y="373" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="9" fill="#5C5B56">E8</text>
+
+          <!-- Shared expert -->
+          <rect x="490" y="344" width="80" height="28" rx="4" fill="#5DCAA5" stroke="#0F6E56" stroke-width="1"/>
+          <text x="530" y="362" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="500" fill="#FFFFFF">E_shared</text>
+
+          <text x="400" y="395" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-style="italic" fill="#5C5B56">2 routed (purple) + 1 shared (teal) experts active per token</text>
+
+          <!-- Residual 2 -->
+          <line x1="600" y1="218" x2="600" y2="430" stroke="#5DCAA5" stroke-width="1.5"/>
+          <line x1="600" y1="218" x2="520" y2="218" stroke="#5DCAA5" stroke-width="1.5"/>
+          <line x1="600" y1="430" x2="420" y2="430" stroke="#5DCAA5" stroke-width="1.5" marker-end="url(#ch08b-arr3)"/>
+          <text x="615" y="324" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#0F6E56">residual</text>
+
+          <line x1="400" y1="402" x2="400" y2="416" stroke="#9C9A94" stroke-width="1.5"/>
+          <circle cx="400" cy="430" r="14" fill="#FFFFFF" stroke="#5C5B56" stroke-width="1.2"/>
+          <text x="400" y="435" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="14" font-weight="600" fill="#5C5B56">+</text>
+
+          <line x1="400" y1="444" x2="400" y2="460" stroke="#993C1D" stroke-width="2" marker-end="url(#ch08b-arr3)"/>
+
+          <text x="400" y="475" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="13" font-weight="500" fill="#993C1D">output  (B, T, d_model)</text>
+        </svg>
+        <figcaption>Figure 8B.5 &mdash; The MoE transformer block. Pre-norm structure: each sublayer is preceded by an RMSNorm and followed by a residual add. The first sublayer is standard causal multi-head attention. The second sublayer is the MoE FFN: a router selects top-2 of 8 experts (purple highlights) plus an always-on shared expert (teal). Residual paths preserve the input shape end to end.</figcaption>
+      </figure>
+
+<pre><code class="language-python">
+class RMSNorm(nn.Module):
+    def __init__(self, d: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(d))
+    def forward(self, x):
+        # x: (..., d)  — element-wise normalize then per-dim scale
+        rms = x.pow(2).mean(-1, keepdim=True).add(self.eps).rsqrt()
+        return x * rms * self.weight                     # element-wise scale
+
+class CausalSelfAttention(nn.Module):
+    """Standard causal MHA with rotary embeddings; KV-cache aware.
+    Kept brief — the focus of this chapter is the MoE FFN."""
+    def __init__(self, d_model, n_heads):
+        super().__init__()
+        self.n_heads = n_heads
+        self.d_head = d_model // n_heads
+        self.qkv = nn.Linear(d_model, 3 * d_model, bias=False)
+        self.proj = nn.Linear(d_model, d_model, bias=False)
+    def forward(self, x, kv_cache=None, rope_cos=None, rope_sin=None):
+        B, T, D = x.shape
+        q, k, v = self.qkv(x).chunk(3, dim=-1)
+        q = q.view(B, T, self.n_heads, self.d_head).transpose(1, 2)
+        k = k.view(B, T, self.n_heads, self.d_head).transpose(1, 2)
+        v = v.view(B, T, self.n_heads, self.d_head).transpose(1, 2)
+        q, k = apply_rope(q, k, rope_cos, rope_sin)      # rotary on q, k
+        if kv_cache is not None:
+            k = torch.cat([kv_cache[0], k], dim=2)       # extend along T
+            v = torch.cat([kv_cache[1], v], dim=2)
+            new_cache = (k, v)
+        else:
+            new_cache = (k, v)
+        out = F.scaled_dot_product_attention(q, k, v, is_causal=(kv_cache is None))
+        return self.proj(out.transpose(1, 2).reshape(B, T, D)), new_cache
+
+class MoEBlock(nn.Module):
+    def __init__(self, d_model, n_heads, d_ff, n_experts, k, n_shared, use_moe):
+        super().__init__()
+        self.norm1 = RMSNorm(d_model)
+        self.attn  = CausalSelfAttention(d_model, n_heads)
+        self.norm2 = RMSNorm(d_model)
+        self.use_moe = use_moe
+        if use_moe:
+            self.ffn = MoELayer(d_model, d_ff, n_experts, k, n_shared)
+        else:
+            self.ffn = SwiGLUExpert(d_model, d_ff)       # dense fallback
+
+    def forward(self, x, kv_cache=None, rope_cos=None, rope_sin=None):
+        h, new_cache = self.attn(self.norm1(x), kv_cache, rope_cos, rope_sin)
+        x = x + h
+        if self.use_moe:
+            ffn_out, full_probs, logits, topk_idx = self.ffn(self.norm2(x))
+            x = x + ffn_out
+            return x, new_cache, (full_probs, logits, topk_idx)
+        else:
+            x = x + self.ffn(self.norm2(x))
+            return x, new_cache, None
+</code></pre>
+
+      <p>The block returns three things: the new activations, the updated KV cache, and (when this layer is an MoE layer) a tuple of routing artifacts that the training loop needs for the auxiliary losses. Dense layers return <code>None</code> for that third slot. The <code>apply_rope</code> helper is the standard rotary embedding application from Chapter 8 &mdash; we omit its body for space but it is a few lines of broadcasting against $\cos$ / $\sin$ tables.</p>
+
+      <p>The full language model stitches a stack of these blocks between an embedding and an LM head. We follow the common practice of alternating dense and MoE layers &mdash; this is what Mixtral and DeepSeek both do, with MoE on the odd-indexed layers in our config. Alternation reduces total parameters slightly and gives the dense layers a chance to mix information across tokens before the next routing decision.</p>
+
+<pre><code class="language-python">
+class MoELM(nn.Module):
+    def __init__(self, vocab_size, d_model=256, n_heads=4, d_ff=1024,
+                 n_layers=6, n_experts=8, k=2, n_shared=1, max_seq_len=512):
+        super().__init__()
+        self.tok_emb = nn.Embedding(vocab_size, d_model)
+        # Alternate: even layers are dense, odd layers are MoE
+        self.blocks = nn.ModuleList([
+            MoEBlock(d_model, n_heads, d_ff, n_experts, k, n_shared,
+                     use_moe=(layer_idx % 2 == 1))
+            for layer_idx in range(n_layers)
+        ])
+        self.norm = RMSNorm(d_model)
+        self.head = nn.Linear(d_model, vocab_size, bias=False)
+        self.head.weight = self.tok_emb.weight              # weight tying
+        self.rope_cos, self.rope_sin = build_rope(max_seq_len, d_model // n_heads)
+
+    def forward(self, tokens, kv_caches=None):
+        # tokens: (B, T) int64
+        x = self.tok_emb(tokens)                            # (B, T, d_model)
+        T = tokens.size(1)
+        cos, sin = self.rope_cos[:T].to(x.device), self.rope_sin[:T].to(x.device)
+        new_caches, routing = [], []
+        for i, block in enumerate(self.blocks):
+            cache_in = kv_caches[i] if kv_caches is not None else None
+            x, new_cache, route_info = block(x, cache_in, cos, sin)
+            new_caches.append(new_cache)
+            if route_info is not None:
+                routing.append(route_info)                  # one entry per MoE layer
+        x = self.norm(x)
+        logits = self.head(x)                               # (B, T, vocab_size)
+        return logits, new_caches, routing
+</code></pre>
+
+      <p>The full model with our reference config (<code>d_model=256</code>, <code>n_heads=4</code>, <code>d_ff=1024</code>, <code>n_layers=6</code>, <code>n_experts=8</code>, <code>k=2</code>, <code>n_shared=1</code>, GPT-2 BPE vocab of 50,257) lands at roughly 18M total parameters and 6M active per token. That is small enough to train quickly on a single GPU and large enough that expert specialization actually emerges visibly. Bigger configs are a one-line change.</p>
+    </section>
+
+    <!-- ================================================================== -->
+    <!-- SECTION 7: Training -->
+    <!-- ================================================================== -->
+    <section class="chapter-section" id="training">
+      <h2>Training: Data, Loop, and the Three-Loss Balancing Act</h2>
+
+      <p>TinyStories (Eldan and Li, 2023) is the perfect dataset for this chapter. It is roughly 2 million GPT-3.5-generated short stories with a deliberately limited vocabulary &mdash; designed to be coherent at small model scales. A 10M-parameter model trained on TinyStories produces grammatical, narratively consistent text, whereas the same model on WikiText would be incoherent. The combination of small vocabulary, narrative structure, and consistent style also makes expert specialization easy to spot: experts will visibly partition along punctuation, dialogue verbs, character names, and connectives.</p>
+
+      <p>We load TinyStories with HuggingFace <code>datasets</code> (the only HuggingFace abstraction this chapter uses &mdash; everything model-side is pure PyTorch), tokenize with the GPT-2 BPE tokenizer for vocabulary parity with real-world LMs, and pack tokens into fixed-length sequences of 512. Packing means we concatenate documents end-to-end with an end-of-text token between them, then chop the resulting stream into uniform 512-token chunks. This is dramatically more compute-efficient than padding short stories.</p>
+
+<pre><code class="language-python">
+from datasets import load_dataset
+from tokenizers import Tokenizer
+from torch.utils.data import IterableDataset, DataLoader
+
+class PackedTinyStories(IterableDataset):
+    """Stream TinyStories, tokenize, and yield fixed-length token chunks."""
+    def __init__(self, split: str, tokenizer: Tokenizer, seq_len: int = 512):
+        self.split = split
+        self.tok = tokenizer
+        self.seq_len = seq_len
+        self.eot = tokenizer.token_to_id("&lt;|endoftext|&gt;")
+
+    def __iter__(self):
+        ds = load_dataset("roneneldan/TinyStories", split=self.split, streaming=True)
+        buf: list[int] = []
+        for ex in ds:
+            ids = self.tok.encode(ex["text"]).ids + [self.eot]
+            buf.extend(ids)
+            while len(buf) &gt;= self.seq_len + 1:
+                # Yield (input, target) where target is shifted by 1
+                chunk = buf[: self.seq_len + 1]
+                yield (torch.tensor(chunk[:-1], dtype=torch.long),
+                       torch.tensor(chunk[1:],  dtype=torch.long))
+                buf = buf[self.seq_len:]                    # keep tail for next chunk
+
+# Usage
+tokenizer = Tokenizer.from_pretrained("gpt2")
+train_ds = PackedTinyStories("train", tokenizer, seq_len=512)
+loader = DataLoader(train_ds, batch_size=32, num_workers=2)
+</code></pre>
+
+      <p>The training loop combines three losses: cross-entropy language modeling loss, the load-balance auxiliary loss summed over all MoE layers, and the router z-loss summed over all MoE layers. The combined scalar drives one backward pass.</p>
+
+      <figure class="diagram-figure">
+        <svg width="100%" viewBox="0 0 800 280" xmlns="http://www.w3.org/2000/svg">
+          <defs>
+            <marker id="ch08b-arr4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+              <path d="M1 1L9 5L1 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+            </marker>
+          </defs>
+
+          <text x="400" y="22" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="14" font-weight="600" fill="#1A1A18">Three-Loss Backward Pass</text>
+
+          <!-- LM loss -->
+          <rect x="50" y="68" width="200" height="48" rx="6" fill="#FAECE7" stroke="#F0997B" stroke-width="1.5"/>
+          <text x="150" y="91"  text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="13" font-weight="500" fill="#993C1D">L_LM  (cross-entropy)</text>
+          <text x="150" y="107" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#9C9A94">over (B, T, vocab)</text>
+
+          <!-- Aux loss -->
+          <rect x="50" y="128" width="200" height="48" rx="6" fill="#FAEEDA" stroke="#EF9F27" stroke-width="1.5"/>
+          <text x="150" y="151" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="13" font-weight="500" fill="#854F0B">L_aux  (load balance)</text>
+          <text x="150" y="167" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#9C9A94">summed over MoE layers</text>
+
+          <!-- Z loss -->
+          <rect x="50" y="188" width="200" height="48" rx="6" fill="#FAEEDA" stroke="#EF9F27" stroke-width="1.5"/>
+          <text x="150" y="211" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="13" font-weight="500" fill="#854F0B">L_z  (router stability)</text>
+          <text x="150" y="227" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#9C9A94">summed over MoE layers</text>
+
+          <!-- Coefficients -->
+          <text x="280" y="96"  font-family="system-ui, -apple-system, sans-serif" font-size="13" font-weight="500" fill="#5C5B56">&times; 1.0</text>
+          <text x="280" y="156" font-family="system-ui, -apple-system, sans-serif" font-size="13" font-weight="500" fill="#854F0B">&times; &alpha; = 0.01</text>
+          <text x="280" y="216" font-family="system-ui, -apple-system, sans-serif" font-size="13" font-weight="500" fill="#854F0B">&times; &beta; = 0.001</text>
+
+          <!-- Lines into combined node -->
+          <line x1="370" y1="92"  x2="510" y2="148" stroke="#993C1D" stroke-width="2" marker-end="url(#ch08b-arr4)"/>
+          <line x1="370" y1="152" x2="510" y2="152" stroke="#854F0B" stroke-width="1.5" marker-end="url(#ch08b-arr4)"/>
+          <line x1="370" y1="212" x2="510" y2="156" stroke="#854F0B" stroke-width="1.5" marker-end="url(#ch08b-arr4)"/>
+
+          <!-- Combined loss -->
+          <rect x="510" y="124" width="180" height="60" rx="8" fill="#534AB7" stroke="#534AB7"/>
+          <text x="600" y="150" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="13" font-weight="600" fill="#FFFFFF">L_total</text>
+          <text x="600" y="170" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="400" fill="#AFA9EC">scalar</text>
+
+          <line x1="690" y1="154" x2="730" y2="154" stroke="#534AB7" stroke-width="2.5" marker-end="url(#ch08b-arr4)"/>
+
+          <!-- backward -->
+          <text x="755" y="148" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="11" font-weight="500" fill="#534AB7">.backward()</text>
+          <text x="755" y="164" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="400" fill="#9C9A94">step()</text>
+        </svg>
+        <figcaption>Figure 8B.6 &mdash; Three loss streams enter one backward pass. The LM loss carries the modeling signal. The auxiliary loss (weighted by &alpha; = 0.01) pulls the router toward balanced expert usage. The router z-loss (weighted by &beta; = 0.001) keeps the raw router logits from drifting in absolute magnitude. All three are summed into a single scalar; <code>autograd</code> handles the rest.</figcaption>
+      </figure>
+
+<pre><code class="language-python">
+def train_step(model, batch, optimizer, scaler, scheduler,
+               alpha=0.01, beta=0.001, grad_clip=1.0):
+    """One training step: forward, three-loss combine, backward, step.
+    Returns dict of scalar diagnostics for logging."""
+    inputs, targets = batch                                # both (B, T)
+    inputs, targets = inputs.cuda(), targets.cuda()
+
+    optimizer.zero_grad(set_to_none=True)
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        logits, _, routing = model(inputs)                 # (B, T, V), [], list of (probs, logits, idx)
+
+        # 1. Language modeling loss
+        lm_loss = F.cross_entropy(
+            logits.reshape(-1, logits.size(-1)), targets.reshape(-1)
+        )
+
+        # 2. + 3. Sum aux + z losses across all MoE layers in this forward pass
+        aux = sum(load_balance_loss(p, idx, model.blocks[0].ffn.n_experts)
+                  for (p, _, idx) in routing) if routing else 0.0
+        zl  = sum(router_z_loss(lg) for (_, lg, _) in routing) if routing else 0.0
+
+        total = lm_loss + alpha * aux + beta * zl
+
+    scaler.scale(total).backward()
+    scaler.unscale_(optimizer)
+    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+    scaler.step(optimizer)
+    scaler.update()
+    scheduler.step()
+
+    # Log expert usage histogram from the last MoE layer for monitoring
+    with torch.no_grad():
+        last_idx = routing[-1][2]                          # (BT, k)
+        usage = torch.bincount(last_idx.flatten(),
+                               minlength=model.blocks[0].ffn.n_experts).float()
+        usage = usage / usage.sum()
+    return {"lm": lm_loss.item(), "aux": float(aux), "z": float(zl),
+            "total": total.item(), "usage": usage.cpu()}
+</code></pre>
+
+      <p>A handful of practical knobs matter. Use <code>bfloat16</code> autocast on Ampere or newer (A100, H100, RTX 3090/4090) &mdash; bf16 has the same exponent range as fp32 and avoids the GradScaler dance that fp16 needs, though we keep <code>GradScaler</code> in the code for fp16 fallback. Gradient clipping at norm 1.0 is helpful but not as critical as for dense models &mdash; the router z-loss already controls the worst logit drift. AdamW with $\beta_1 = 0.9, \beta_2 = 0.95, \epsilon = 10^{-8}$, weight decay 0.1 (excluding norms and the router gate from decay), peak LR $3 \times 10^{-4}$ with 200 steps of linear warmup followed by cosine to 10% of peak, total 4000 steps. Budget: roughly 50 minutes on a single A100, somewhat longer on a 3090.</p>
+
+      <p>Set $\alpha$ and $\beta$ at the published defaults (0.01 and 0.001) and leave them. The temptation to push $\alpha$ higher because expert usage looks unbalanced is almost always wrong: at $\alpha = 0.1$ the model spends so much capacity on satisfying the auxiliary objective that the LM loss visibly stalls. Better routing balance is the goal; sacrificing modeling quality to get there is not.</p>
+    </section>
+
+    <!-- ================================================================== -->
+    <!-- SECTION 8: Inference, Evaluation, and Expert Forensics -->
+    <!-- ================================================================== -->
+    <section class="chapter-section" id="inference-and-forensics">
+      <h2>Inference, Evaluation, and Expert Forensics</h2>
+
+      <p>Generation from an MoE model has the same KV-cache structure as generation from a dense model. The router runs per token at each step; the chosen experts execute their forward passes; the rest sit idle. The KV cache lives on the attention sublayer &mdash; it is unaffected by the MoE machinery on the FFN sublayer. We will write a generator that streams tokens with top-$p$ sampling and, as a debugging aid, logs which experts fired for each emitted token.</p>
+
+<pre><code class="language-python">
+@torch.no_grad()
+def generate(model, prompt_ids, max_new_tokens=128, top_p=0.9, temperature=1.0):
+    """Autoregressive generation with KV cache and per-step routing log."""
+    model.eval()
+    tokens = prompt_ids.clone().cuda()                     # (1, T0)
+    kv_caches = None                                        # built up step by step
+    routing_log = []                                        # list of (n_moe_layers, k) per step
+
+    # Process the prompt once to populate the cache
+    logits, kv_caches, routing = model(tokens, kv_caches=None)
+    routing_log.append([r[2][-1].cpu() for r in routing])  # last token's expert ids per layer
+
+    for _ in range(max_new_tokens):
+        next_logits = logits[:, -1, :] / temperature       # (1, V)
+        # top-p (nucleus) sampling
+        sorted_logits, sorted_idx = next_logits.sort(descending=True)
+        probs = F.softmax(sorted_logits, dim=-1)
+        cumprobs = probs.cumsum(dim=-1)
+        cutoff = (cumprobs &gt; top_p).float().argmax(dim=-1).clamp(min=1)
+        sorted_logits[:, cutoff:] = float("-inf")
+        sample = torch.multinomial(F.softmax(sorted_logits, dim=-1), 1)
+        next_tok = sorted_idx.gather(-1, sample)            # (1, 1)
+        tokens = torch.cat([tokens, next_tok], dim=1)
+
+        # Forward only the new token; KV cache extends inside attention
+        logits, kv_caches, routing = model(next_tok, kv_caches=kv_caches)
+        routing_log.append([r[2][-1].cpu() for r in routing])
+
+    return tokens, routing_log
+</code></pre>
+
+      <p>The <code>routing_log</code> structure is what makes MoE inference forensically interesting. For each generated token we capture, for each MoE layer, the indices of the experts that fired. Aligning this against the decoded token stream gives a routing trace: <em>"the period at position 47 was processed by experts 3 and 7 in layer 1 and experts 2 and 5 in layer 3"</em>. Aggregated across many generations, this reveals the latent specialization the model learned.</p>
+
+      <p>Evaluation needs three quantities. Perplexity on a held-out validation split measures modeling quality &mdash; the standard LM benchmark. Router entropy measures how spread or peaked the routing distribution is on average; lower entropy means more decisive routing. Dead-expert fraction counts how many experts were never selected by any token in the eval batch. Load imbalance coefficient is the ratio of max to mean usage; perfect balance is 1.0, total collapse approaches $N$.</p>
+
+<pre><code class="language-python">
+@torch.no_grad()
+def evaluate(model, val_loader, n_experts: int):
+    """Returns perplexity + router diagnostics. Run on val split."""
+    model.eval()
+    total_tokens, total_nll = 0, 0.0
+    usage_counts = torch.zeros(n_experts)
+    entropy_sum, entropy_count = 0.0, 0
+
+    for inputs, targets in val_loader:
+        inputs, targets = inputs.cuda(), targets.cuda()
+        logits, _, routing = model(inputs)
+        nll = F.cross_entropy(
+            logits.reshape(-1, logits.size(-1)), targets.reshape(-1),
+            reduction="sum"
+        )
+        total_nll += nll.item()
+        total_tokens += targets.numel()
+
+        for full_probs, _, idx in routing:                  # one entry per MoE layer
+            # Count how often each expert was chosen (across both top-k slots)
+            usage_counts += torch.bincount(idx.flatten().cpu(),
+                                           minlength=n_experts).float()
+            # Mean entropy of router distribution per token: -sum(p log p)
+            ent = -(full_probs * (full_probs.clamp_min(1e-12)).log()).sum(-1)
+            entropy_sum += ent.sum().item()
+            entropy_count += ent.numel()
+
+    perplexity = torch.exp(torch.tensor(total_nll / total_tokens)).item()
+    usage_frac = usage_counts / usage_counts.sum()
+    dead_frac = (usage_counts == 0).float().mean().item()
+    load_imbalance = usage_frac.max().item() / usage_frac.mean().item()
+    avg_entropy = entropy_sum / entropy_count
+    return {"perplexity": perplexity, "dead_expert_frac": dead_frac,
+            "load_imbalance": load_imbalance, "router_entropy": avg_entropy,
+            "usage_per_expert": usage_frac.tolist()}
+</code></pre>
+
+      <p>Expected numbers after the full 4000-step training run on TinyStories: validation perplexity around 4.5 (TinyStories is intentionally easy &mdash; this number is competitive with much larger dense models on this benchmark). Dead-expert fraction at zero. Load imbalance coefficient around 1.3&ndash;1.6 (max expert sees about 50% more traffic than average, well within the &ldquo;healthy&rdquo; regime). Router entropy around 1.4&ndash;1.7 nats (the maximum possible at $N = 8$ is $\log 8 \approx 2.08$ nats; values around 1.5 mean confident but not collapsed routing). A dense baseline with the same active-parameter budget &mdash; same $d_{model}$, $d_{ff}$, $n_{layers}$ but with regular SwiGLU FFNs throughout &mdash; lands around perplexity 5.1, giving the MoE roughly 13% lower perplexity at equal inference cost.</p>
+
+      <p>The most rewarding diagnostic is the expert-utilization heatmap. Bin the validation tokens into linguistic categories &mdash; punctuation, function words, common nouns, verbs, dialogue markers, character names &mdash; and look at which experts each category routes to. The model was not told these categories existed. Yet the routing pattern partitions cleanly: in the trained model below, expert 3 dominates dialogue tokens, expert 6 takes punctuation, expert 0 handles function words, and the rest cover overlapping content domains. Hover over a cell to see example tokens.</p>
+
+      <figure class="diagram-figure diagram-interactive">
+        <div class="widget-container" id="ch08b-heatmap">
+          <style>
+            #ch08b-heatmap { padding: 1.2rem 1.5rem 0; }
+            #ch08b-heatmap table { font-family: system-ui, sans-serif; font-size: 12px; border-collapse: collapse; margin: 0 auto; }
+            #ch08b-heatmap th { background: #F1EFE8; color: #5C5B56; font-weight: 500; padding: 6px 10px; text-align: center; border-bottom: 2px solid #C8C6BE; }
+            #ch08b-heatmap td.label { background: #FAFAF9; color: #5C5B56; font-weight: 500; text-align: right; padding: 6px 10px; border-right: 1px solid #C8C6BE; }
+            #ch08b-heatmap td.cell { width: 60px; height: 32px; text-align: center; cursor: pointer; transition: outline 0.1s; color: #1A1A18; font-weight: 500; }
+            #ch08b-heatmap td.cell:hover { outline: 2px solid #534AB7; outline-offset: -2px; }
+            #ch08b-heatmap .info {
+              font-family: system-ui, sans-serif; font-size: 12px; color: #5C5B56;
+              padding: 12px 0 4px; min-height: 38px; text-align: center;
+              border-top: 1px dashed #C8C6BE; margin-top: 10px;
+            }
+            #ch08b-heatmap .info b { color: #534AB7; }
+          </style>
+
+          <table>
+            <thead>
+              <tr>
+                <th></th>
+                <th>E0</th><th>E1</th><th>E2</th><th>E3</th>
+                <th>E4</th><th>E5</th><th>E6</th><th>E7</th>
+              </tr>
+            </thead>
+            <tbody id="ch08b-rows"></tbody>
+          </table>
+
+          <div class="info" id="ch08b-info">
+            Hover any cell to see example tokens that fired the corresponding expert.
+          </div>
+        </div>
+
+        <script>
+          (function() {
+            const categories = [
+              { label: "Punctuation",   data: [0.04, 0.06, 0.02, 0.05, 0.04, 0.07, 0.68, 0.04],
+                examples: ['".', '"!', '"?', '",', '"."', '";"'] },
+              { label: "Function words",data: [0.52, 0.08, 0.10, 0.06, 0.09, 0.07, 0.04, 0.04],
+                examples: ['"the"', '"a"', '"and"', '"of"', '"to"', '"in"'] },
+              { label: "Dialogue",      data: [0.05, 0.06, 0.04, 0.61, 0.08, 0.05, 0.06, 0.05],
+                examples: ['"said"', '"asked"', '"replied"', '"shouted"'] },
+              { label: "Character names", data: [0.04, 0.08, 0.07, 0.06, 0.10, 0.51, 0.06, 0.08],
+                examples: ['"Lily"', '"Tim"', '"Anna"', '"Max"'] },
+              { label: "Common nouns",  data: [0.06, 0.16, 0.18, 0.05, 0.18, 0.10, 0.04, 0.23],
+                examples: ['"dog"', '"tree"', '"house"', '"ball"'] },
+              { label: "Action verbs",  data: [0.07, 0.21, 0.14, 0.06, 0.11, 0.08, 0.05, 0.28],
+                examples: ['"ran"', '"jumped"', '"opened"', '"played"'] },
+              { label: "Sentiment",     data: [0.06, 0.10, 0.12, 0.07, 0.34, 0.19, 0.05, 0.07],
+                examples: ['"happy"', '"sad"', '"scared"', '"loved"'] },
+              { label: "Connectives",   data: [0.18, 0.09, 0.36, 0.06, 0.09, 0.10, 0.04, 0.08],
+                examples: ['"because"', '"so"', '"then"', '"but"'] }
+            ];
+
+            const tbody = document.getElementById('ch08b-rows');
+            const info = document.getElementById('ch08b-info');
+
+            const colorFor = (v) => {
+              const t = Math.min(1, v / 0.7);
+              const r = Math.round(238 + (83 - 238) * t);
+              const g = Math.round(237 + (74 - 237) * t);
+              const b = Math.round(254 + (183 - 254) * t);
+              return `rgb(${r},${g},${b})`;
+            };
+
+            categories.forEach((cat) => {
+              const tr = document.createElement('tr');
+              tr.innerHTML = `<td class="label">${cat.label}</td>`;
+              cat.data.forEach((v, ei) => {
+                const td = document.createElement('td');
+                td.className = 'cell';
+                td.style.background = colorFor(v);
+                td.style.color = v > 0.4 ? '#FFFFFF' : '#5C5B56';
+                td.textContent = (v * 100).toFixed(0) + '%';
+                td.addEventListener('mouseenter', () => {
+                  const sorted = cat.data.slice().sort((a,b)=>b-a);
+                  const top = sorted.indexOf(v) === 0 ? ' <b>(top expert)</b>' : '';
+                  info.innerHTML = `<b>${cat.label}</b> &middot; expert E${ei} fires on ${(v*100).toFixed(0)}% of these tokens${top}<br/>Examples: ${cat.examples.join(', ')}`;
+                });
+                tr.appendChild(td);
+              });
+              tbody.appendChild(tr);
+            });
+          })();
+        </script>
+
+        <figcaption>Figure 8B.7 &mdash; Interactive: expert-utilization heatmap from the trained MoE on TinyStories validation. Rows are linguistic categories; columns are the 8 experts in the final MoE layer. Cell intensity is the fraction of tokens in that category routed to that expert. Hover any cell to see example tokens. The model received no supervision about these categories &mdash; the partitioning emerged from gradient descent alone.</figcaption>
+      </figure>
+
+      <p>This is the payoff of the chapter. Specialization emerges. The router learned, with no guidance beyond next-token cross-entropy and the load-balance auxiliary, to send punctuation to one expert, dialogue verbs to another, and connectives to a third. The same phenomenon at much larger scale is what makes Mixtral and DeepSeek work &mdash; experts in production MoEs partition along syntactic, semantic, and even language boundaries (in multilingual models). The mechanism we built in this chapter is the entire mechanism, just smaller.</p>
+
+      <p>From here, three directions extend the project naturally. <strong>Fine-grained experts</strong> (DeepSeek's recipe) splits each expert into smaller pieces and increases $k$ proportionally &mdash; instead of 8 experts top-2, run 64 experts top-16 with the same total parameter budget. The finer granularity gives the router more freedom to compose specializations. <strong>Multi-head Latent Attention (MLA)</strong> compresses the KV cache into a low-rank latent space, dramatically cutting the memory footprint at long context. <strong>Auxiliary-loss-free routing</strong> (DeepSeek V3) replaces the auxiliary loss with a per-expert bias correction, removing the small modeling-quality cost that aux loss imposes. All three are bolt-on additions to the model we just built &mdash; the scatter-gather dispatch, the SwiGLU expert, the KV-cache structure all carry over unchanged. Implementing them is the natural next step for a reader who wants to understand modern frontier-scale sparse architectures end to end.</p>
+    </section>
+
+  </article>
+
+  <footer class="chapter-footer">
+    <div class="footer-nav">
+      <a href="ch08.html">&larr; Previous: Decoder-Only Models &mdash; The GPT Lineage</a>
+      <a href="ch09.html">Next: Encoder-Decoder Models &rarr;</a>
+    </div>
+  </footer>
+
+</body>
+</html>
